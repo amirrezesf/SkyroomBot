@@ -33,7 +33,9 @@ try:
         QRadioButton, QButtonGroup, QPlainTextEdit, QMessageBox,
         QFileDialog, QDialog, QDialogButtonBox, QFormLayout, QGroupBox,
         QMenu, QStatusBar, QFrame, QSizePolicy, QScrollArea, QTextEdit,
-        QListWidget, QListWidgetItem, QAbstractItemView
+        QListWidget, QListWidgetItem, QAbstractItemView,
+        QAction, QFont, QColor, QTextCharFormat, QTextCursor, QFontDatabase, QIcon
+        
     )
 except ImportError as e:
     print("PyQt6 is not installed. Run:\n    pip install PyQt6")
@@ -1418,7 +1420,15 @@ def main():
     app.setApplicationName("Skyroom Bot")
     app.setOrganizationName(SETTINGS_ORG)
     app.setStyle("Fusion")
-
+    
+    # ---- application icon ----
+    if getattr(sys, 'frozen', False):
+        icon_path = Path(sys._MEIPASS) / 'assets' / 'icon-512.png'
+    else:
+        icon_path = Path(__file__).parent / 'assets' / 'icon-512.png'
+    if icon_path.exists():
+        app.setWindowIcon(QIcon(str(icon_path)))
+        
     window = SkyroomGUI()
 
     if "--json" in sys.argv:

@@ -12,6 +12,7 @@ a = Analysis(
     binaries=[],
     datas=[
         (str(CHROMEDRIVER), 'drivers'),
+        ('assets/icon-512.png', 'assets'),  
     ] + collect_data_files('PyQt6'),
     hiddenimports=[
         'PyQt6.QtCore',
@@ -52,4 +53,5 @@ exe = EXE(
     upx=True,
     console=False,
     windowed=True,
+    icon='assets/icon.ico',
 )
