@@ -8,9 +8,9 @@
 
 <br/>
 
-[![Build & Release](https://github.com/OWNER/SkyroomBot/actions/workflows/build.yml/badge.svg)](https://github.com/OWNER/SkyroomBot/actions/workflows/build.yml)
-[![Latest Release](https://img.shields.io/github/v/release/OWNER/SkyroomBot?include_prereleases&label=آخرین%20نسخه&color=6a3fff)](https://github.com/OWNER/SkyroomBot/releases/latest)
-[![License](https://img.shields.io/github/license/OWNER/SkyroomBot?label=مجوز&color=blue)](LICENSE)
+[![Build & Release](https://github.com/amirrezesf/SkyroomBot/actions/workflows/build.yml/badge.svg)](https://github.com/amirrezesf/SkyroomBot/actions/workflows/build.yml)
+[![Latest Release](https://img.shields.io/github/v/release/amirrezesf/SkyroomBot?include_prereleases&label=آخرین%20نسخه&color=6a3fff)](https://github.com/amirrezesf/SkyroomBot/releases/latest)
+[![License](https://img.shields.io/github/license/amirrezesf/SkyroomBot?label=مجوز&color=blue)](LICENSE)
 [![Platform](https://img.shields.io/badge/پلتفرم-Windows%20%7C%20Linux-2ea44f)](#دانلود)
 
 </div>
@@ -46,7 +46,7 @@
 
 ## دانلود
 
-آخرین نسخه را از صفحهٔ [Releases](https://github.com/OWNER/SkyroomBot/releases/latest) دریافت کنید.
+آخرین نسخه را از صفحهٔ [Releases](https://github.com/amirrezesf/SkyroomBot/releases/latest) دریافت کنید.
 
 | پلتفرم | فایل | حجم تقریبی |
 |---|---|---|
