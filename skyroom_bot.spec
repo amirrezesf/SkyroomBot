@@ -23,7 +23,9 @@ a = Analysis(
         'selenium.webdriver.common.keys',
         'selenium.webdriver.support.expected_conditions',
         'selenium.webdriver.support.ui',
-    ] + collect_submodules('selenium'),
+        'tzdata',           
+    ] + collect_submodules('selenium')
+      + collect_submodules('tzdata'),
     hookspath=[],
     runtime_hooks=[],
     excludes=[
