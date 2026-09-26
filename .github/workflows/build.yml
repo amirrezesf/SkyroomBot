@@ -4,20 +4,72 @@ on:
   push:
     branches: [ main, master ]
     tags:     [ 'v*' ]
-  pull_request:
-    branches: [ main, master ]
   workflow_dispatch:
 
-# Required so the release job can create tags, releases, and attach files.
 permissions:
   contents: write
 
 jobs:
   # =========================================================
-  # 1) Build on both operating systems in parallel
+  # شرط اجرای کل workflow
+  # =========================================================
+  # اجرا می‌شود اگر:
+  #   - push تگ v* باشد (release رسمی)
+  #   - یا commit message شامل [build] باشد
+  #   - یا manual از Actions tab اجرا شود
+  #   - و حتماً بدون [skip ci] باشد
+  # =========================================================
+  guard:
+    name: Check trigger condition
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - name: Decide
+        id: check
+        shell: bash
+        run: |
+          MSG="${{ github.event.head_commit.message }}"
+          REF_TYPE="${{ github.ref_type }}"
+          EVENT="${{ github.event_name }}"
+
+          # پیش‌فرض: اجرا نکن
+          RUN="false"
+
+          # تگ v* همیشه اجرا می‌شود
+          if [[ "$REF_TYPE" == "tag" ]]; then
+            RUN="true"
+            echo "Triggered by tag push"
+          fi
+
+          # workflow_dispatch (اجرای دستی) همیشه اجرا می‌شود
+          if [[ "$EVENT" == "workflow_dispatch" ]]; then
+            RUN="true"
+            echo "Triggered manually"
+          fi
+
+          # اگر commit message شامل [build] باشد
+          if echo "$MSG" | grep -q '\[build\]'; then
+            RUN="true"
+            echo "Triggered by [build] keyword"
+          fi
+
+          # [skip ci] بر همه چیز اولویت دارد
+          if echo "$MSG" | grep -q '\[skip ci\]'; then
+            RUN="false"
+            echo "Skipped due to [skip ci]"
+          fi
+
+          echo "should_build=$RUN" >> "$GITHUB_OUTPUT"
+          echo "Final decision: $RUN"
+
+  # =========================================================
+  # 1) Build
   # =========================================================
   build:
     name: Build on ${{ matrix.os }}
+    needs: guard
+    if: needs.guard.outputs.should_build == 'true'
     runs-on: ${{ matrix.os }}
 
     strategy:
@@ -81,94 +133,225 @@ jobs:
           if (-not (Test-Path "dist/SkyroomBot.exe")) { throw "binary not built" }
           Write-Host "binary exists"
 
-      # Package the binary into a zip (nice for casual downloaders)
-      - name: Package (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          cd dist
-          zip -r ../${{ matrix.artifact_name }}.zip ${{ matrix.binary_name }}
-
-      - name: Package (Windows)
-        if: matrix.os == 'windows-latest'
-        shell: pwsh
-        run: |
-          Compress-Archive -Path dist\${{ matrix.binary_name }} `
-                           -DestinationPath ${{ matrix.artifact_name }}.zip
-
-      # Upload BOTH the zip and the raw binary as artifacts
-      - name: Upload artifacts
+      - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: |
-            ${{ matrix.artifact_name }}.zip
-            dist/${{ matrix.binary_name }}
+          path: dist/${{ matrix.binary_name }}
           if-no-files-found: error
 
   # =========================================================
-  # 2) Release - runs only on push (not PRs)
+  # 2) Release
   # =========================================================
   release:
     name: Publish GitHub Release
-    needs: build
-    if: github.event_name == 'push'
+    needs: [guard, build]
+    if: |
+      needs.guard.outputs.should_build == 'true' &&
+      (github.ref_type == 'tag' || contains(github.event.head_commit.message, '[build]'))
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0    # full history so release notes can diff commits
+          fetch-depth: 0
 
-      # ---- Compute the version/tag for this run ----
       - name: Determine version
         id: ver
         shell: bash
         run: |
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            # Triggered by pushing a v* tag: use it as-is
             TAG="${GITHUB_REF_NAME}"
           else
-            # Triggered by a push to main: base-version + run number
             BASE=$(cat VERSION | tr -d '[:space:]')
             TAG="v${BASE}.${GITHUB_RUN_NUMBER}"
           fi
-          echo "tag=$TAG"           >> "$GITHUB_OUTPUT"
-          echo "name=Release $TAG"  >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"      >> "$GITHUB_OUTPUT"
+          echo "version=$TAG"  >> "$GITHUB_OUTPUT"
           echo "Resolved tag: $TAG"
 
-      # ---- Download both build artifacts ----
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: List what we got
+      - name: Show files
         run: find artifacts -type f -exec ls -lh {} \;
 
-      # ---- Generate SHA256 checksums for the release assets ----
       - name: Generate checksums
+        id: sums
         shell: bash
         run: |
           cd artifacts
-          find . -type f \( -name '*.zip' -o -name 'SkyroomBot' -o -name 'SkyroomBot.exe' \) \
-            -exec sha256sum {} \; > SHA256SUMS
-          cat SHA256SUMS
+          LINUX_SHA=$(sha256sum SkyroomBot-linux/SkyroomBot | awk '{print $1}')
+          WIN_SHA=$(sha256sum SkyroomBot-windows/SkyroomBot.exe | awk '{print $1}')
+          LINUX_SIZE=$(du -h SkyroomBot-linux/SkyroomBot | cut -f1)
+          WIN_SIZE=$(du -h SkyroomBot-windows/SkyroomBot.exe | cut -f1)
+          {
+            echo "linux_sha=$LINUX_SHA"
+            echo "win_sha=$WIN_SHA"
+            echo "linux_size=$LINUX_SIZE"
+            echo "win_size=$WIN_SIZE"
+          } >> "$GITHUB_OUTPUT"
 
-      # ---- Create the GitHub Release and attach everything ----
-      - name: Create release
+          {
+            echo "$LINUX_SHA  SkyroomBot-linux-x86_64"
+            echo "$WIN_SHA  SkyroomBot-windows-x86_64.exe"
+          } > artifacts/SHA256SUMS
+          cat artifacts/SHA256SUMS
+
+      - name: Build changelog
+        id: changelog
+        shell: bash
+        run: |
+          set -e
+          PREV=$(git tag --sort=-v:refname | grep -E '^v[0-9]' \
+                 | grep -v "^${{ steps.ver.outputs.tag }}$" | head -n1 || true)
+
+          if [[ -z "$PREV" ]]; then
+            RANGE="HEAD"
+            SINCE_TEXT="Initial public release"
+          else
+            RANGE="${PREV}..HEAD"
+            SINCE_TEXT="Changes since ${PREV}"
+          fi
+
+          git log --pretty=format:'%s' "$RANGE" > /tmp/raw_commits.txt || true
+
+          FEATS=$(grep -E '^feat(\(|:|!| )' /tmp/raw_commits.txt | sed 's/^/- /' || true)
+          FIXES=$(grep -E '^fix(\(|:|!| )'  /tmp/raw_commits.txt | sed 's/^/- /' || true)
+          DOCS=$(grep -E '^docs(\(|:|!| )' /tmp/raw_commits.txt | sed 's/^/- /' || true)
+          CHO=$(grep -E '^chore(\(|:|!| )' /tmp/raw_commits.txt | sed 's/^/- /' || true)
+          OTHER=$(grep -vE '^(feat|fix|docs|chore)(\(|:|!| )' /tmp/raw_commits.txt \
+                  | grep -v '^$' | sed 's/^/- /' || true)
+
+          {
+            echo "since_text=$SINCE_TEXT"
+            echo "feats<<EOF"
+            [[ -n "$FEATS" ]] && echo "$FEATS" || echo "- No user-facing changes"
+            echo "EOF"
+            echo "fixes<<EOF"
+            [[ -n "$FIXES" ]] && echo "$FIXES" || echo "- No fixes in this release"
+            echo "EOF"
+            echo "docs<<EOF"
+            [[ -n "$DOCS" ]] && echo "$DOCS" || true
+            echo "EOF"
+            echo "chore<<EOF"
+            [[ -n "$CHO" ]] && echo "$CHO" || true
+            echo "EOF"
+            echo "other<<EOF"
+            [[ -n "$OTHER" ]] && echo "$OTHER" || true
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Compose release body
+        shell: bash
+        env:
+          TAG:         ${{ steps.ver.outputs.tag }}
+          SINCE:       ${{ steps.changelog.outputs.since_text }}
+          FEATS:       ${{ steps.changelog.outputs.feats }}
+          FIXES:       ${{ steps.changelog.outputs.fixes }}
+          DOCS:        ${{ steps.changelog.outputs.docs }}
+          CHORE:       ${{ steps.changelog.outputs.chore }}
+          OTHER:       ${{ steps.changelog.outputs.other }}
+          LINUX_SHA:   ${{ steps.sums.outputs.linux_sha }}
+          WIN_SHA:     ${{ steps.sums.outputs.win_sha }}
+          LINUX_SIZE:  ${{ steps.sums.outputs.linux_size }}
+          WIN_SIZE:    ${{ steps.sums.outputs.win_size }}
+          REPO:        ${{ github.repository }}
+          RUN_URL:     https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          cat > release_body.md <<EOF
+          # Skyroom Bot ${TAG}
+
+          Automated release built from \`${GITHUB_SHA::7}\` on $(date -u '+%Y-%m-%d at %H:%M UTC').
+
+          Skyroom Bot is a desktop application that automatically joins your scheduled Skyroom classes at a random time within a configurable window, keeps a WebSocket watchdog running to recover from dropped connections, and can hibernate your machine between sessions and wake it up right before each class.
+
+          ---
+
+          ## Downloads
+
+          | Platform | File | Size | SHA-256 |
+          |---|---|---|---|
+          | **Windows** (x86-64) | [\`SkyroomBot.exe\`](https://github.com/${REPO}/releases/download/${TAG}/SkyroomBot.exe) | ${WIN_SIZE} | \`${WIN_SHA}\` |
+          | **Linux** (x86-64)   | [\`SkyroomBot\`](https://github.com/${REPO}/releases/download/${TAG}/SkyroomBot)       | ${LINUX_SIZE} | \`${LINUX_SHA}\` |
+
+          A \`SHA256SUMS\` file is attached for scripted verification.
+
+          ---
+
+          ## System requirements
+
+          - **Google Chrome** must be installed. The correct chromedriver is bundled inside each binary — you do **not** need to install Selenium, Python, or chromedriver yourself.
+          - **Windows:** Windows 10 or newer (x86-64).
+          - **Linux:** any modern x86-64 distribution with \`glibc\` 2.31 or newer (Ubuntu 20.04+, Fedora 32+, Debian 11+, or equivalent).
+
+          ---
+
+          ## Installation
+
+          **Windows**
+          1. Download \`SkyroomBot.exe\`.
+          2. Move it to a folder of your choice.
+          3. Double-click to run.
+
+          **Linux**
+          1. Download \`SkyroomBot\`.
+          2. \`chmod +x SkyroomBot\`
+          3. \`./SkyroomBot\`
+
+          **Verify the download**
+          \`\`\`bash
+          sha256sum -c SHA256SUMS
+          \`\`\`
+
+          ---
+
+          ## ${SINCE}
+
+          ### Features
+          ${FEATS}
+
+          ### Fixes
+          ${FIXES}
+          EOF
+
+          if [[ -n "${DOCS}" ]]; then
+            { echo ""; echo "### Documentation"; echo "${DOCS}"; } >> release_body.md
+          fi
+          if [[ -n "${CHORE}" ]]; then
+            { echo ""; echo "### Maintenance"; echo "${CHORE}"; } >> release_body.md
+          fi
+          if [[ -n "${OTHER}" ]]; then
+            { echo ""; echo "### Other changes"; echo "${OTHER}"; } >> release_body.md
+          fi
+
+          cat >> release_body.md <<EOF
+
+          ---
+
+          ## Notes
+
+          - This build targets the current stable Chrome for Testing release.
+          - Configuration and window layout are persisted per user.
+          - Bug reports are welcome via Issues.
+          - Build log: ${RUN_URL}
+          EOF
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
-          name: ${{ steps.ver.outputs.name }}
-          generate_release_notes: true     # auto-notes from commits/PRs since last release
+          name: Skyroom Bot ${{ steps.ver.outputs.tag }}
+          body_path: release_body.md
           draft: false
           prerelease: false
+          make_latest: true
           files: |
-            artifacts/SkyroomBot-linux/SkyroomBot-linux.zip
-            artifacts/SkyroomBot-linux/SkyroomBot
-            artifacts/SkyroomBot-windows/SkyroomBot-windows.zip
             artifacts/SkyroomBot-windows/SkyroomBot.exe
+            artifacts/SkyroomBot-linux/SkyroomBot
             artifacts/SHA256SUMS
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
