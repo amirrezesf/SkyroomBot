@@ -7,13 +7,16 @@ Run:
 
 Persian text is rendered natively by Qt (no arabic_reshaper / bidi needed).
 All settings, the last opened JSON file, and window layout are persisted
-via QSettings (~/.config/SkyroomBot/SkyroomBotGUI.conf on Linux).
+via QSettings (~/.config/SkyroomBot/SkyroomBotGUI.conf on Linux,
+%APPDATA%/SkyroomBot/SkyroomBotGUI.ini on Windows).
 """
 
 import json
 import os
+import platform
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta
@@ -65,6 +68,158 @@ APP_VERSION      = "2.0"
 GITHUB_URL       = "https://github.com/amirrezesf/SkyroomBot"
 GITHUB_ISSUES    = f"{GITHUB_URL}/issues"
 GITHUB_RELEASES  = f"{GITHUB_URL}/releases/latest"
+
+# ============================================================
+# Platform detection (for sleep/wake)
+# ============================================================
+IS_WINDOWS = platform.system() == "Windows"
+IS_LINUX   = platform.system() == "Linux"
+IS_MAC     = platform.system() == "Darwin"
+
+# Name of the Windows Task Scheduler task used for wake
+WINDOWS_TASK_NAME = "SkyroomBotWake"
+
+
+# ============================================================
+# Windows one-time setup PowerShell script (self-elevating)
+#
+# Exit codes:
+#   0 - success
+#   1 - setup failed (details printed to console)
+#   2 - UAC prompt cancelled
+# ============================================================
+_WINDOWS_SETUP_PS1 = r'''
+# skyroom_setup.ps1 - self-elevating setup for SkyroomBot
+$ErrorActionPreference = "Stop"
+
+# ---- self-elevate (with -Wait so the parent waits for us) ----
+if (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    try {
+        $proc = Start-Process powershell -Verb RunAs -Wait -PassThru -ArgumentList @(
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", "`"$PSCommandPath`""
+        )
+        exit $proc.ExitCode
+    } catch {
+        Write-Host ""
+        Write-Host "Elevation was cancelled or denied."
+        Write-Host "Setup cannot continue without Administrator rights."
+        Start-Sleep -Seconds 3
+        exit 2
+    }
+}
+
+# ---- elevated: do the real work ----
+try {
+    Write-Host ""
+    Write-Host "=== SkyroomBot setup ==="
+    Write-Host ""
+
+    # 1. Hibernation
+    Write-Host "[1/3] Enabling hibernation..."
+    try {
+        $hibStatus = (powercfg /a 2>&1 | Out-String)
+        if ($hibStatus -match "Hibernate") {
+            Write-Host "       Already available."
+        } else {
+            powercfg /hibernate on
+            Write-Host "       Enabled."
+        }
+    } catch {
+        Write-Host "       WARNING: could not enable hibernation: $_"
+    }
+
+    # 2. Wake timers
+    Write-Host "[2/3] Allowing wake timers..."
+    powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP RTCWAKE 1
+    powercfg /setdcvalueindex SCHEME_CURRENT SUB_SLEEP RTCWAKE 1
+    powercfg /setactive SCHEME_CURRENT
+    Write-Host "       Enabled for AC and battery."
+
+    # 3. Pre-register the wake task (disabled placeholder)
+    Write-Host "[3/3] Registering wake task (placeholder)..."
+
+    $xml = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>SkyroomBot class wake timer (managed by SkyroomBot app).</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <TimeTrigger>
+      <StartBoundary>2030-01-01T00:00:00</StartBoundary>
+      <Enabled>false</Enabled>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>true</WakeToRun>
+    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>cmd.exe</Command>
+      <Arguments>/c exit</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"@
+
+    $tmp = [System.IO.Path]::GetTempFileName()
+    [System.IO.File]::WriteAllText($tmp, $xml, [System.Text.Encoding]::Unicode)
+
+    $existing = schtasks /Query /TN SkyroomBotWake 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "       Task exists - updating."
+    } else {
+        Write-Host "       Creating new task."
+    }
+    schtasks /Create /TN SkyroomBotWake /XML $tmp /F | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "schtasks failed with code $LASTEXITCODE"
+    }
+    Remove-Item $tmp -ErrorAction SilentlyContinue
+    Write-Host "       Task 'SkyroomBotWake' is registered."
+
+    Write-Host ""
+    Write-Host "=== Setup complete ==="
+    Write-Host ""
+    Write-Host "You can close this window and use 'Arm Wake & Sleep' in the app."
+    Write-Host ""
+    Write-Host "Press any key to close..."
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    exit 0
+}
+catch {
+    Write-Host ""
+    Write-Host "ERROR: $_" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "Press any key to close..."
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    exit 1
+}
+'''
 
 
 def settings() -> QSettings:
@@ -168,6 +323,130 @@ def apply_button_style(button, kind: str = "neutral", big: bool = False):
             color: {p['fg_disabled']};
         }}
     """)
+
+
+# ============================================================
+# Windows wake helpers
+# ============================================================
+def _windows_wake_task_xml(wake_local_iso: str) -> str:
+    return f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Wakes the machine for a scheduled Skyroom class.</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <TimeTrigger>
+      <StartBoundary>{wake_local_iso}</StartBoundary>
+      <Enabled>true</Enabled>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>true</WakeToRun>
+    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>cmd.exe</Command>
+      <Arguments>/c exit</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"""
+
+
+def _windows_arm_and_sleep(mode: str, wake_at) -> tuple[int, str]:
+    try:
+        local_wake = wake_at.astimezone()
+    except Exception:
+        local_wake = wake_at
+    wake_iso = local_wake.strftime("%Y-%m-%dT%H:%M:%S")
+
+    xml = _windows_wake_task_xml(wake_iso)
+
+    tmp_dir = Path(os.environ.get("TEMP", "."))
+    tmp_file = tmp_dir / f"skyroom_wake_{int(time.time() * 1000)}.xml"
+    try:
+        tmp_file.write_text(xml, encoding="utf-16")
+    except Exception as e:
+        return 1, f"could not write task XML: {e}"
+
+    cf = 0
+    if IS_WINDOWS:
+        cf = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+    try:
+        create = subprocess.run(
+            ["schtasks", "/Create",
+             "/TN", WINDOWS_TASK_NAME,
+             "/XML", str(tmp_file),
+             "/F"],
+            capture_output=True, text=True, creationflags=cf,
+        )
+    except Exception as e:
+        return 1, f"schtasks /Create failed: {e}"
+    finally:
+        try:
+            tmp_file.unlink()
+        except OSError:
+            pass
+
+    if create.returncode != 0:
+        err = (create.stderr or create.stdout or "").strip()
+        low = err.lower()
+        if "access is denied" in low or "denied" in low:
+            err += ("\n\nThis operation needs Administrator privileges. "
+                    "Right-click the app (or its shortcut) and choose "
+                    "'Run as administrator' once to create the task.")
+        return create.returncode, err
+
+    if mode == "mem":
+        sleep_cmd = ["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"]
+    else:
+        sleep_cmd = ["shutdown", "/h"]
+
+    try:
+        sleep_proc = subprocess.run(
+            sleep_cmd, capture_output=True, text=True, creationflags=cf,
+        )
+    except Exception as e:
+        subprocess.run(["schtasks", "/Delete", "/TN", WINDOWS_TASK_NAME, "/F"],
+                       capture_output=True, text=True, creationflags=cf)
+        return 1, f"sleep command failed to launch: {e}"
+
+    if sleep_proc.returncode != 0:
+        err = (sleep_proc.stderr or sleep_proc.stdout or "").strip()
+        low = err.lower()
+        if "hibernate" in low or "not enabled" in low:
+            err += ("\n\nHibernation is not enabled. Run this once as "
+                    "Administrator:\n    powercfg /hibernate on")
+        subprocess.run(["schtasks", "/Delete", "/TN", WINDOWS_TASK_NAME, "/F"],
+                       capture_output=True, text=True, creationflags=cf)
+        return sleep_proc.returncode, err
+
+    subprocess.run(["schtasks", "/Delete", "/TN", WINDOWS_TASK_NAME, "/F"],
+                   capture_output=True, text=True, creationflags=cf)
+    return 0, ""
 
 
 # ============================================================
@@ -333,7 +612,6 @@ class SkyroomGUI(QMainWindow):
         self.bridge.log.connect(self._append_log)
         self.bridge.finished.connect(self._on_bot_finished)
 
-        # ---- load config from QSettings BEFORE building the UI ----
         self.cfg = self._load_config_from_settings()
 
         self._build_ui()
@@ -342,18 +620,16 @@ class SkyroomGUI(QMainWindow):
         self._refresh_tree()
         self.refresh_next_wake()
 
-        # ---- restore window/splitter/tab and last JSON ----
         self._restore_ui_state()
 
         self._tick = QTimer(self)
         self._tick.timeout.connect(self.refresh_next_wake)
         self._tick.start(30_000)
 
-        # ---- پیشنهاد یک‌باره ستاره دادن در گیت‌هاب (پس از ۴ ثانیه) ----
         QTimer.singleShot(4000, self._maybe_show_star_hint)
 
     # =========================================================
-    # Persistence: load / save
+    # Persistence
     # =========================================================
     def _load_config_from_settings(self) -> RuntimeConfig:
         s = settings()
@@ -378,7 +654,6 @@ class SkyroomGUI(QMainWindow):
         )
 
     def _restore_ui_state(self):
-        """Called after _build_ui() — restores everything not covered by cfg."""
         s = settings()
 
         geo = s.value("window/geometry")
@@ -499,7 +774,6 @@ class SkyroomGUI(QMainWindow):
 
         outer.addWidget(self._build_action_bar())
 
-        # ---- نوار وضعیت با لینک دائمی گیت‌هاب ----
         self.status = QStatusBar()
         self.setStatusBar(self.status)
         self.status.showMessage("آماده")
@@ -545,7 +819,6 @@ class SkyroomGUI(QMainWindow):
         act_quit.triggered.connect(self.close)
         file_menu.addAction(act_quit)
 
-        # ---- منوی راهنما با لینک‌های گیت‌هاب ----
         help_menu = menubar.addMenu("&راهنما")
 
         act_github = QAction("مشاهده در گیت‌هاب", self)
@@ -708,7 +981,9 @@ class SkyroomGUI(QMainWindow):
         desc = QLabel(
             "زمان بیداری RTC را فعال می‌کند و لپ‌تاپ را به خواب می‌برد. "
             "پس از بیدار شدن، همان برنامه ادامه می‌یابد و (در صورت فعال بودن) "
-            "ربات به صورت خودکار شروع می‌کند."
+            "ربات به صورت خودکار شروع می‌کند.\n\n"
+            "اولین‌بار که روی دکمهٔ پایین کلیک کنید، برنامه به‌طور خودکار "
+            "دسترسی لازم را از شما درخواست می‌کند."
         )
         desc.setStyleSheet("color: gray; font-size: 11px;")
         desc.setWordWrap(True)
@@ -761,18 +1036,9 @@ class SkyroomGUI(QMainWindow):
         self.btn_arm_sleep.clicked.connect(self.arm_wake_and_sleep)
         v.addWidget(self.btn_arm_sleep)
 
-        setup_btn = QPushButton("راه‌اندازی اولیه دسترسی (یک‌بار)")
-        apply_button_style(setup_btn, "neutral")
-        setup_btn.clicked.connect(self.setup_wake_permission)
-        v.addWidget(setup_btn, alignment=Qt.AlignmentFlag.AlignLeft)
-
-        hint = QLabel(
-            "اگر خطای sudo گرفتید، این دکمه را بزنید و دستور نمایش داده شده "
-            "را یک‌بار در ترمینال اجرا کنید."
-        )
-        hint.setStyleSheet("color: gray; font-size: 11px;")
-        hint.setWordWrap(True)
-        v.addWidget(hint)
+        # NOTE: the standalone "Setup permission" button was removed.
+        # arm_wake_and_sleep() now detects missing permissions on its own
+        # and prompts the user at the right moment.
 
         v.addStretch(1)
 
@@ -1217,6 +1483,239 @@ class SkyroomGUI(QMainWindow):
             f"{wake_at:%Y-%m-%d %H:%M:%S}  (تا {h} ساعت و {m} دقیقه دیگر)"
         )
 
+    # ---------------------------------------------------------
+    # Permission check + setup flow
+    # ---------------------------------------------------------
+    def _check_wake_permissions(self) -> bool:
+        """
+        Returns True if the current user can arm a wake without any
+        additional prompts.
+
+        Linux:  sudoers must have NOPASSWD for /usr/bin/rtcwake
+        Windows: the SkyroomBotWake task must already exist
+        """
+        if IS_WINDOWS:
+            cf = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            try:
+                r = subprocess.run(
+                    ["schtasks", "/Query", "/TN", WINDOWS_TASK_NAME],
+                    capture_output=True, text=True,
+                    creationflags=cf, timeout=8,
+                )
+                return r.returncode == 0
+            except Exception:
+                return False
+
+        # ---- Linux / macOS ----
+        try:
+            r = subprocess.run(
+                ["sudo", "-n", "-l", "/usr/bin/rtcwake"],
+                capture_output=True, text=True, timeout=6,
+            )
+        except Exception:
+            return False
+        if r.returncode != 0:
+            return False
+        out = r.stdout or ""
+        return "NOPASSWD" in out and "rtcwake" in out
+
+    def _show_setup_prompt(self) -> bool:
+        """
+        Show the platform-appropriate permission setup dialog.
+        Returns True if the setup succeeded, False if the user cancelled
+        or the setup failed.
+        """
+        if IS_WINDOWS:
+            return self._windows_setup_flow()
+        else:
+            return self._linux_setup_flow()
+
+    def _linux_setup_flow(self) -> bool:
+        user = os.environ.get("USER") or os.environ.get("LOGNAME") or "$USER"
+        cmd = (f"echo '{user} ALL=(ALL) NOPASSWD: /usr/bin/rtcwake' | "
+               f"sudo tee /etc/sudoers.d/skyroom-rtcwake && "
+               f"sudo chmod 440 /etc/sudoers.d/skyroom-rtcwake && "
+               f"sudo -k")
+
+        result = {"ok": False}
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("نیاز به دسترسی برای خواب و بیدارباش")
+        dlg.resize(780, 340)
+        v = QVBoxLayout(dlg)
+
+        info = QLabel(
+            "برای اجرای بیدارباش، برنامه به اجازهٔ اجرای rtcwake بدون "
+            "رمز عبور نیاز دارد.\n\n"
+            "این دستور را یک‌بار در ترمینال اجرا کنید، سپس روی "
+            "«بررسی مجدد» بزنید:"
+        )
+        info.setWordWrap(True)
+        v.addWidget(info)
+
+        text = QTextEdit()
+        text.setPlainText(cmd)
+        text.setReadOnly(True)
+        text.setFont(QFont(_pick_mono_font(), 10))
+        text.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        text.setFixedHeight(80)
+        v.addWidget(text)
+
+        status = QLabel("")
+        status.setWordWrap(True)
+        v.addWidget(status)
+
+        h = QHBoxLayout()
+        copy_btn = QPushButton("کپی در حافظه")
+        apply_button_style(copy_btn, "neutral")
+        recheck_btn = QPushButton("بررسی مجدد")
+        apply_button_style(recheck_btn, "start")
+        cancel_btn = QPushButton("لغو")
+        apply_button_style(cancel_btn, "stop")
+        h.addWidget(copy_btn)
+        h.addWidget(recheck_btn)
+        h.addWidget(cancel_btn)
+        h.addStretch(1)
+        v.addLayout(h)
+
+        def _do_copy():
+            QApplication.clipboard().setText(cmd)
+            status.setText("دستور در کلیپ‌بورد کپی شد.")
+            status.setStyleSheet("color: #7a8ba8; font-size: 12px;")
+
+        def _do_recheck():
+            if self._check_wake_permissions():
+                result["ok"] = True
+                status.setText("✅ دسترسی تایید شد.")
+                status.setStyleSheet(
+                    "color: #2a7f42; font-size: 12px; font-weight: bold;")
+                self._append_log("INFO", "دسترسی rtcwake تایید شد")
+                QTimer.singleShot(600, dlg.accept)
+            else:
+                status.setText(
+                    "❌ هنوز تنظیم نشده. مطمئن شوید دستور را در ترمینال "
+                    "اجرا کرده‌اید.")
+                status.setStyleSheet(
+                    "color: #c0392b; font-size: 12px; font-weight: bold;")
+
+        copy_btn.clicked.connect(_do_copy)
+        recheck_btn.clicked.connect(_do_recheck)
+        cancel_btn.clicked.connect(dlg.reject)
+
+        dlg.exec()
+        return result["ok"]
+
+    def _windows_setup_flow(self) -> bool:
+        result = {"ok": False}
+        state = {"running": False}
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("نیاز به دسترسی برای خواب و بیدارباش")
+        dlg.resize(740, 340)
+        v = QVBoxLayout(dlg)
+
+        info = QLabel(
+            "برای فعال‌سازی خواب و بیدارباش خودکار، ویندوز به یک‌بار "
+            "دسترسی Administrator نیاز دارد.\n\n"
+            "با کلیک روی «اجرای راه‌اندازی»، برنامه مراحل زیر را "
+            "خودکار انجام می‌دهد:\n"
+            "  ۱) فعال‌سازی هایبرنیت\n"
+            "  ۲) اجازهٔ Wake Timers\n"
+            "  ۳) ثبت تسک بیداری\n\n"
+            "ویندوز یک پنجرهٔ UAC نمایش می‌دهد. روی «Yes» بزنید."
+        )
+        info.setWordWrap(True)
+        v.addWidget(info)
+
+        status = QLabel("آماده برای اجرا.")
+        status.setStyleSheet("color: gray; font-size: 12px;")
+        status.setWordWrap(True)
+        v.addWidget(status)
+
+        h = QHBoxLayout()
+        run_btn = QPushButton("اجرای راه‌اندازی")
+        apply_button_style(run_btn, "start")
+        copy_btn = QPushButton("کپی اسکریپت")
+        apply_button_style(copy_btn, "neutral")
+        cancel_btn = QPushButton("لغو")
+        apply_button_style(cancel_btn, "stop")
+        h.addWidget(run_btn)
+        h.addWidget(copy_btn)
+        h.addWidget(cancel_btn)
+        h.addStretch(1)
+        v.addLayout(h)
+
+        def _do_copy():
+            QApplication.clipboard().setText(_WINDOWS_SETUP_PS1)
+            status.setText("اسکریپت در کلیپ‌بورد کپی شد.")
+            status.setStyleSheet("color: #7a8ba8; font-size: 12px;")
+
+        def _do_run():
+            if state["running"]:
+                return
+            state["running"] = True
+            run_btn.setEnabled(False)
+            copy_btn.setEnabled(False)
+            cancel_btn.setEnabled(False)
+            status.setText("⏳ در حال اجرا… پنجرهٔ UAC را تایید کنید.")
+            status.setStyleSheet("color: #7a8ba8; font-size: 12px;")
+            threading.Thread(target=_bg_run, daemon=True).start()
+
+        def _bg_run():
+            try:
+                tmp = Path(tempfile.gettempdir()) / "skyroom_setup.ps1"
+                tmp.write_text(_WINDOWS_SETUP_PS1, encoding="utf-8-sig")
+                cf = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                proc = subprocess.run(
+                    ["powershell.exe",
+                     "-NoProfile",
+                     "-ExecutionPolicy", "Bypass",
+                     "-File", str(tmp)],
+                    capture_output=True, text=True, creationflags=cf,
+                )
+                rc = proc.returncode
+                out = (proc.stdout or "").strip()
+                err = (proc.stderr or "").strip()
+                QTimer.singleShot(0, lambda: _on_done(rc, out, err))
+            except Exception as e:
+                QTimer.singleShot(0, lambda er=str(e): _on_done(1, "", er))
+
+        def _on_done(rc, out, err):
+            state["running"] = False
+            run_btn.setEnabled(True)
+            copy_btn.setEnabled(True)
+            cancel_btn.setEnabled(True)
+
+            if rc == 0:
+                result["ok"] = True
+                status.setText("✅ راه‌اندازی با موفقیت انجام شد.")
+                status.setStyleSheet(
+                    "color: #2a7f42; font-size: 12px; font-weight: bold;")
+                self._append_log("INFO",
+                                 "راه‌اندازی ویندوز با موفقیت انجام شد")
+                QTimer.singleShot(700, dlg.accept)
+            elif rc == 2:
+                status.setText("⚠️ درخواست UAC لغو شد. راه‌اندازی انجام نشد.")
+                status.setStyleSheet(
+                    "color: #c98a00; font-size: 12px; font-weight: bold;")
+                self._append_log("WARNING", "کاربر درخواست UAC را لغو کرد")
+            else:
+                detail = (err or out or "").strip()[:500]
+                status.setText(
+                    f"❌ راه‌اندازی ناموفق (کد {rc}). جزئیات در گزارش.")
+                status.setStyleSheet(
+                    "color: #c0392b; font-size: 12px; font-weight: bold;")
+                self._append_log(
+                    "ERROR",
+                    f"راه‌اندازی ویندوز ناموفق (کد {rc}): {detail}")
+
+        run_btn.clicked.connect(_do_run)
+        copy_btn.clicked.connect(_do_copy)
+        cancel_btn.clicked.connect(dlg.reject)
+
+        dlg.exec()
+        return result["ok"]
+
     def arm_wake_and_sleep(self):
         if not self.users:
             QMessageBox.information(self, "توجه",
@@ -1251,19 +1750,48 @@ class SkyroomGUI(QMainWindow):
                     break
                 time.sleep(0.25)
 
+        # ---- permission gate: check, then prompt if needed ----
+        if not self._check_wake_permissions():
+            self._append_log("INFO",
+                             "دسترسی خواب/بیداری تنظیم نشده — درخواست از کاربر")
+            if not self._show_setup_prompt():
+                self._append_log("INFO", "کاربر راه‌اندازی را لغو کرد")
+                return
+            if not self._check_wake_permissions():
+                QMessageBox.critical(
+                    self, "راه‌اندازی کامل نشد",
+                    "به نظر می‌رسد راه‌اندازی اولیه به درستی انجام نشده است.\n"
+                    "دوباره تلاش کنید یا دستور را در ترمینال اجرا کنید."
+                )
+                return
+
+        # ---- mode selection and confirmation ----
         mode = "disk"
         for val, rb in self._sleep_radio_by_value.items():
             if rb.isChecked():
                 mode = val
                 break
-        mode_name = {"mem": "خواب (suspend)",
-                     "disk": "هایبرنیت (hibernate)",
-                     "off": "خاموش کامل (power off)"}[mode]
+
+        if IS_WINDOWS:
+            mode_name = {
+                "mem":  "خواب (Suspend)",
+                "disk": "هایبرنیت (Hibernate)",
+                "off":  "هایبرنیت (Hibernate) — «خاموش کامل» روی ویندوز پشتیبانی نمی‌شود",
+            }[mode]
+        else:
+            mode_name = {
+                "mem":  "خواب (suspend)",
+                "disk": "هایبرنیت (hibernate)",
+                "off":  "خاموش کامل (power off)",
+            }[mode]
 
         warn_off = ""
-        if mode == "off":
+        if mode == "off" and IS_LINUX:
             warn_off = ("\n\nتوجه: خاموش کامل باعث می‌شود برنامه "
                         "پس از روشن شدن دوباره باز نشود.")
+        elif mode == "off" and IS_WINDOWS:
+            warn_off = ("\n\nتوجه: ویندوز از «خاموش کامل + بیداری خودکار» "
+                        "پشتیبانی نمی‌کند. به جای آن هایبرنیت انجام می‌شود.")
 
         r = QMessageBox.question(
             self, "تایید",
@@ -1277,51 +1805,82 @@ class SkyroomGUI(QMainWindow):
         if r != QMessageBox.StandardButton.Yes:
             return
 
-        # save state BEFORE we hibernate, so a power-cut won't lose settings
         self._save_all_state()
 
-        epoch = int(wake_at.timestamp())
-        cmd = ["sudo", "-n", "rtcwake", "-m", mode, "-t", str(epoch)]
-        self._append_log("INFO", "در حال تنظیم بیداری: " + " ".join(cmd))
         self._append_log(
             "INFO",
-            f"کلاس {class_start:%H:%M} -> بیداری {wake_at:%H:%M:%S}"
+            f"در حال تنظیم بیداری برای {wake_at:%Y-%m-%d %H:%M:%S} "
+            f"و رفتن به حالت {mode_name}"
         )
 
         self.btn_arm_sleep.setEnabled(False)
         threading.Thread(
-            target=self._do_rtcwake, args=(cmd,), daemon=True).start()
+            target=self._do_arm_and_sleep,
+            args=(mode, wake_at), daemon=True
+        ).start()
 
-    def _do_rtcwake(self, cmd):
+    def _do_arm_and_sleep(self, mode: str, wake_at):
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if IS_WINDOWS:
+                rc, err = _windows_arm_and_sleep(mode, wake_at)
+            else:
+                epoch = int(wake_at.timestamp())
+                cmd = ["sudo", "-n", "rtcwake", "-m", mode, "-t", str(epoch)]
+                self._emit_log("INFO",
+                               "اجرای دستور: " + " ".join(cmd))
+                proc = subprocess.run(cmd, capture_output=True, text=True)
+                rc = proc.returncode
+                err = (proc.stderr or proc.stdout or "").strip()
         except Exception as e:
-            self._emit_log("ERROR", f"rtcwake ناموفق: {e}")
-            QTimer.singleShot(0, lambda: self.btn_arm_sleep.setEnabled(True))
-            return
+            rc, err = 1, str(e)
 
-        if proc.returncode != 0:
-            err = (proc.stderr or proc.stdout or "").strip()
-            self._emit_log("ERROR", f"rtcwake ناموفق: {err}")
-            QTimer.singleShot(0, lambda: self._on_rtcwake_error(err))
+        if rc != 0:
+            self._emit_log("ERROR", f"خواب/بیداری ناموفق: {err}")
+            QTimer.singleShot(0, lambda e=err: self._on_wake_error(e))
             return
 
         QTimer.singleShot(0, self._on_woke_up)
 
-    def _on_rtcwake_error(self, msg: str):
+    def _on_wake_error(self, msg: str):
         self.btn_arm_sleep.setEnabled(True)
         low = (msg or "").lower()
-        if ("sudo" in low or "password" in low or
-                "a terminal is required" in low or
-                "no tty present" in low):
-            QMessageBox.critical(
-                self, "نیاز به sudo",
-                "rtcwake به sudo بدون رمز نیاز دارد.\n\n"
-                "دکمه «راه‌اندازی اولیه دسترسی» را بزنید و دستور نمایش "
-                "داده شده را در ترمینال اجرا کنید."
-            )
+
+        if IS_WINDOWS:
+            if ("access is denied" in low or "denied" in low
+                    or "administrator" in low):
+                QMessageBox.critical(
+                    self, "نیاز به دسترسی Administrator",
+                    "برای ساخت تسک بیداری، برنامه باید یک‌بار با دسترسی "
+                    "Administrator اجرا شود.\n\n"
+                    "روی آیکن برنامه راست‌کلیک کنید و "
+                    "«Run as administrator» را انتخاب کنید، یا از تب "
+                    "«خواب و بیدارباش» دوباره تلاش کنید تا درخواست UAC "
+                    "نمایش داده شود.\n\n"
+                    "جزئیات خطا:\n" + msg
+                )
+            elif "hibernate" in low or "not enabled" in low:
+                QMessageBox.critical(
+                    self, "هایبرنیت فعال نیست",
+                    "هایبرنیت روی این سیستم فعال نیست.\n\n"
+                    "روی «خواب و بیدارباش» بزنید تا دوباره راه‌اندازی "
+                    "خودکار اجرا شود."
+                )
+            else:
+                QMessageBox.critical(self, "خواب/بیداری ناموفق",
+                                     msg or "(بدون خروجی)")
         else:
-            QMessageBox.critical(self, "rtcwake ناموفق", msg or "(بدون خروجی)")
+            if ("sudo" in low or "password" in low or
+                    "a terminal is required" in low or
+                    "no tty present" in low):
+                QMessageBox.critical(
+                    self, "نیاز به دسترسی",
+                    "برای اجرای rtcwake نیاز به دسترسی بدون رمز است.\n\n"
+                    "دوباره روی «خواب و بیدارباش» بزنید تا مراحل "
+                    "راه‌اندازی نمایش داده شود."
+                )
+            else:
+                QMessageBox.critical(self, "خواب/بیداری ناموفق",
+                                     msg or "(بدون خروجی)")
 
     def _on_woke_up(self):
         self.btn_arm_sleep.setEnabled(True)
@@ -1342,44 +1901,6 @@ class SkyroomGUI(QMainWindow):
             return
         self._append_log("INFO", "شروع خودکار ربات")
         self.start_bot()
-
-    def setup_wake_permission(self):
-        user = os.environ.get("USER") or os.environ.get("LOGNAME") or "$USER"
-        cmd = (f"echo '{user} ALL=(ALL) NOPASSWD: /usr/bin/rtcwake' | "
-               f"sudo tee /etc/sudoers.d/skyroom-rtcwake && "
-               f"sudo chmod 440 /etc/sudoers.d/skyroom-rtcwake && "
-               f"sudo -k")
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle("راه‌اندازی اولیه دسترسی")
-        dlg.resize(720, 220)
-        v = QVBoxLayout(dlg)
-
-        v.addWidget(QLabel("این دستور را یک‌بار در ترمینال اجرا کنید:"))
-
-        text = QTextEdit()
-        text.setPlainText(cmd)
-        text.setReadOnly(True)
-        text.setFont(QFont(_pick_mono_font(), 10))
-        text.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
-        text.setFixedHeight(80)
-        v.addWidget(text)
-
-        h = QHBoxLayout()
-        copy_btn = QPushButton("کپی در حافظه")
-        apply_button_style(copy_btn, "neutral")
-        copy_btn.clicked.connect(
-            lambda: (QApplication.clipboard().setText(cmd),
-                     self._append_log("INFO", "دستور در کلیپ‌بورد کپی شد")))
-        close_btn = QPushButton("بستن")
-        apply_button_style(close_btn, "neutral")
-        close_btn.clicked.connect(dlg.accept)
-        h.addWidget(copy_btn)
-        h.addWidget(close_btn)
-        h.addStretch(1)
-        v.addLayout(h)
-
-        dlg.exec()
 
     # ---------------------------------------------------------
     # Logging
@@ -1457,17 +1978,12 @@ class SkyroomGUI(QMainWindow):
         box.exec()
 
     def _maybe_show_star_hint(self):
-        """
-        یک‌بار، پس از اولین اجرا و ۴ ثانیه انتظار، از کاربر می‌پرسد
-        که آیا مخزن را ستاره می‌دهد یا نه. دیگر تکرار نمی‌شود.
-        """
         s = settings()
         if s.value("promo/star_hint_shown", False, type=bool):
             return
 
         first_run = s.value("promo/first_run", "", type=str)
         if not first_run:
-            # این اولین اجراست — فقط ثبت می‌کنیم و پیام را برای اجرای بعد می‌گذاریم
             s.setValue("promo/first_run",
                        datetime.now(TEHRAN_TZ).isoformat())
             s.sync()
@@ -1502,7 +2018,6 @@ class SkyroomGUI(QMainWindow):
                 return
             self.bot.stop(join_timeout=5)
 
-        # persist everything before we go
         self._save_all_state()
         event.accept()
 
@@ -1521,7 +2036,6 @@ def main():
     app.setOrganizationName(SETTINGS_ORG)
     app.setStyle("Fusion")
 
-    # ---- application icon ----
     if getattr(sys, 'frozen', False):
         icon_path = Path(sys._MEIPASS) / 'assets' / 'icon-512.png'
     else:
