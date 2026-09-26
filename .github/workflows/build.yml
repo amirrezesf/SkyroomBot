@@ -1,28 +1,35 @@
-name: Build
+name: Build & Release
 
 on:
   push:
     branches: [ main, master ]
-    tags: [ 'v*' ]         # also build when you push a version tag
+    tags:     [ 'v*' ]
   pull_request:
     branches: [ main, master ]
-  workflow_dispatch:        # allow manual trigger from the Actions tab
+  workflow_dispatch:
+
+# Required so the release job can create tags, releases, and attach files.
+permissions:
+  contents: write
 
 jobs:
+  # =========================================================
+  # 1) Build on both operating systems in parallel
+  # =========================================================
   build:
     name: Build on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
 
     strategy:
-      fail-fast: false     # one failing OS shouldn't kill the other
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             artifact_name: SkyroomBot-linux
-            exe_path: dist/SkyroomBot
+            binary_name: SkyroomBot
           - os: windows-latest
             artifact_name: SkyroomBot-windows
-            exe_path: dist/SkyroomBot.exe
+            binary_name: SkyroomBot.exe
 
     steps:
       - name: Checkout
@@ -40,11 +47,10 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install pyinstaller
 
-      - name: Download chromedriver
+      - name: Download matching chromedriver
         run: python scripts/download_chromedriver.py
 
-      # ---- Linux only: minimal X libs so PyQt6 can import at runtime ----
-      - name: Install Linux runtime libs (for Qt)
+      - name: Install Linux runtime libraries (Qt)
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
@@ -53,73 +59,116 @@ jobs:
             libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 \
             libxcb-shape0 libxcb-xinerama0
 
-      - name: Build
+      - name: Build with PyInstaller
         run: python -m PyInstaller --clean --noconfirm skyroom_bot.spec
 
-      # ---- Linux only: mark the binary executable ----
       - name: Make Linux binary executable
         if: matrix.os == 'ubuntu-latest'
-        run: chmod +x dist/SkyroomBot
+        run: chmod +x dist/${{ matrix.binary_name }}
 
-      # ---- Quick smoke test that the binary starts (headless) ----
       - name: Smoke test (Linux)
         if: matrix.os == 'ubuntu-latest'
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          timeout 15 ./dist/SkyroomBot --help || true
-          echo "binary exists: $(test -f dist/SkyroomBot && echo yes || echo no)"
+          test -f dist/SkyroomBot && echo "binary exists"
+          timeout 10 ./dist/SkyroomBot || true
 
       - name: Smoke test (Windows)
         if: matrix.os == 'windows-latest'
-        run: |
-          if (Test-Path dist/SkyroomBot.exe) { echo "binary exists" }
-          else { throw "binary not built" }
         shell: pwsh
+        run: |
+          if (-not (Test-Path "dist/SkyroomBot.exe")) { throw "binary not built" }
+          Write-Host "binary exists"
 
-      # ---- Package the single executable into a zip for easier download ----
-      - name: Package artifact (Linux)
+      # Package the binary into a zip (nice for casual downloaders)
+      - name: Package (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
           cd dist
-          zip -r ../${{ matrix.artifact_name }}.zip SkyroomBot
+          zip -r ../${{ matrix.artifact_name }}.zip ${{ matrix.binary_name }}
 
-      - name: Package artifact (Windows)
+      - name: Package (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          Compress-Archive -Path dist\SkyroomBot.exe -DestinationPath ${{ matrix.artifact_name }}.zip
+          Compress-Archive -Path dist\${{ matrix.binary_name }} `
+                           -DestinationPath ${{ matrix.artifact_name }}.zip
 
-      - name: Upload artifact
+      # Upload BOTH the zip and the raw binary as artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.artifact_name }}.zip
+          path: |
+            ${{ matrix.artifact_name }}.zip
+            dist/${{ matrix.binary_name }}
           if-no-files-found: error
-          retention-days: 30
 
-
+  # =========================================================
+  # 2) Release - runs only on push (not PRs)
+  # =========================================================
   release:
     name: Publish GitHub Release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+
     steps:
-      - name: Download all artifacts
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # full history so release notes can diff commits
+
+      # ---- Compute the version/tag for this run ----
+      - name: Determine version
+        id: ver
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            # Triggered by pushing a v* tag: use it as-is
+            TAG="${GITHUB_REF_NAME}"
+          else
+            # Triggered by a push to main: base-version + run number
+            BASE=$(cat VERSION | tr -d '[:space:]')
+            TAG="v${BASE}.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "tag=$TAG"           >> "$GITHUB_OUTPUT"
+          echo "name=Release $TAG"  >> "$GITHUB_OUTPUT"
+          echo "Resolved tag: $TAG"
+
+      # ---- Download both build artifacts ----
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Show files
-        run: find artifacts -type f
+      - name: List what we got
+        run: find artifacts -type f -exec ls -lh {} \;
 
-      - name: Create Release
+      # ---- Generate SHA256 checksums for the release assets ----
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd artifacts
+          find . -type f \( -name '*.zip' -o -name 'SkyroomBot' -o -name 'SkyroomBot.exe' \) \
+            -exec sha256sum {} \; > SHA256SUMS
+          cat SHA256SUMS
+
+      # ---- Create the GitHub Release and attach everything ----
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            artifacts/SkyroomBot-linux/*.zip
-            artifacts/SkyroomBot-windows/*.zip
-          generate_release_notes: true
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.name }}
+          generate_release_notes: true     # auto-notes from commits/PRs since last release
           draft: false
+          prerelease: false
+          files: |
+            artifacts/SkyroomBot-linux/SkyroomBot-linux.zip
+            artifacts/SkyroomBot-linux/SkyroomBot
+            artifacts/SkyroomBot-windows/SkyroomBot-windows.zip
+            artifacts/SkyroomBot-windows/SkyroomBot.exe
+            artifacts/SHA256SUMS
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
