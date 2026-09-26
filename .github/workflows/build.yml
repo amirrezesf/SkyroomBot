@@ -198,8 +198,8 @@ jobs:
           {
             echo "$LINUX_SHA  SkyroomBot-linux-x86_64"
             echo "$WIN_SHA  SkyroomBot-windows-x86_64.exe"
-          } > artifacts/SHA256SUMS
-          cat artifacts/SHA256SUMS
+          } > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Build changelog
         id: changelog
