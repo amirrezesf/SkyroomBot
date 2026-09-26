@@ -21,10 +21,11 @@ from pathlib import Path
 
 try:
     from PyQt6.QtCore import (
-        Qt, QTimer, pyqtSignal, QObject, QSize, QSettings
+        Qt, QTimer, pyqtSignal, QObject, QSize, QSettings, QUrl
     )
     from PyQt6.QtGui import (
-        QAction, QFont, QColor, QTextCharFormat, QTextCursor, QFontDatabase
+        QAction, QFont, QColor, QTextCharFormat, QTextCursor,
+        QFontDatabase, QIcon, QDesktopServices
     )
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -34,8 +35,6 @@ try:
         QFileDialog, QDialog, QDialogButtonBox, QFormLayout, QGroupBox,
         QMenu, QStatusBar, QFrame, QSizePolicy, QScrollArea, QTextEdit,
         QListWidget, QListWidgetItem, QAbstractItemView,
-        QAction, QFont, QColor, QTextCharFormat, QTextCursor, QFontDatabase, QIcon
-        
     )
 except ImportError as e:
     print("PyQt6 is not installed. Run:\n    pip install PyQt6")
@@ -58,12 +57,19 @@ from skyroom_core import (
 SETTINGS_ORG = "SkyroomBot"
 SETTINGS_APP = "SkyroomBotGUI"
 
+# ============================================================
+# Project metadata (also used in the About dialog and links)
+# ============================================================
+APP_NAME         = "ربات اسکای‌روم"
+APP_VERSION      = "2.0"
+GITHUB_URL       = "https://github.com/amirrezesf/SkyroomBot"
+GITHUB_ISSUES    = f"{GITHUB_URL}/issues"
+GITHUB_RELEASES  = f"{GITHUB_URL}/releases/latest"
+
 
 def settings() -> QSettings:
     return QSettings(SETTINGS_ORG, SETTINGS_APP)
 
-import sys
-from pathlib import Path
 
 def get_chromedriver_path():
     if getattr(sys, 'frozen', False):
@@ -343,6 +349,9 @@ class SkyroomGUI(QMainWindow):
         self._tick.timeout.connect(self.refresh_next_wake)
         self._tick.start(30_000)
 
+        # ---- پیشنهاد یک‌باره ستاره دادن در گیت‌هاب (پس از ۴ ثانیه) ----
+        QTimer.singleShot(4000, self._maybe_show_star_hint)
+
     # =========================================================
     # Persistence: load / save
     # =========================================================
@@ -372,7 +381,6 @@ class SkyroomGUI(QMainWindow):
         """Called after _build_ui() — restores everything not covered by cfg."""
         s = settings()
 
-        # -- window geometry / state --
         geo = s.value("window/geometry")
         if geo is not None:
             self.restoreGeometry(geo)
@@ -380,17 +388,14 @@ class SkyroomGUI(QMainWindow):
         if wstate is not None:
             self.restoreState(wstate)
 
-        # -- splitter --
         splitter_state = s.value("window/splitter")
         if splitter_state is not None and hasattr(self, "_splitter"):
             self._splitter.restoreState(splitter_state)
 
-        # -- active tab --
         tab = s.value("window/active_tab", 0, type=int)
         if 0 <= tab < self.tabs.count():
             self.tabs.setCurrentIndex(tab)
 
-        # -- wake tab --
         self.v_wake_lead.setValue(s.value("wake/lead_min", 3, type=int))
         self.v_auto_after_wake.setChecked(
             s.value("wake/auto_start", True, type=bool))
@@ -398,7 +403,6 @@ class SkyroomGUI(QMainWindow):
         if mode in self._sleep_radio_by_value:
             self._sleep_radio_by_value[mode].setChecked(True)
 
-        # -- auto-load last JSON (unless already loaded via --json) --
         if self.json_path is None:
             last = s.value("files/last_json", "", type=str)
             if last:
@@ -407,13 +411,12 @@ class SkyroomGUI(QMainWindow):
                     try:
                         self._load_json_from_path(p)
                     except Exception:
-                        pass   # silently ignore; user can load manually
+                        pass
 
     def _save_all_state(self):
         s = settings()
         cfg = self._collect_config()
 
-        # -- general --
         s.setValue("chromedriver_path", cfg.chromedriver_path)
         s.setValue("send_message", cfg.send_message)
         s.setValue("chat_message", cfg.chat_message)
@@ -425,14 +428,12 @@ class SkyroomGUI(QMainWindow):
         s.setValue("min_delay_min", cfg.min_delay_min)
         s.setValue("max_delay_min", cfg.max_delay_min)
 
-        # -- debug --
         s.setValue("debug_mode", cfg.debug_mode)
         s.setValue("debug_run_now", cfg.debug_run_now)
         s.setValue("debug_disable_random_delay",
                    cfg.debug_disable_random_delay)
         s.setValue("debug_disable_ws_check", cfg.debug_disable_ws_check)
 
-        # -- wake --
         s.setValue("wake/lead_min", self.v_wake_lead.value())
         s.setValue("wake/auto_start", self.v_auto_after_wake.isChecked())
         for val, rb in self._sleep_radio_by_value.items():
@@ -440,11 +441,9 @@ class SkyroomGUI(QMainWindow):
                 s.setValue("wake/sleep_mode", val)
                 break
 
-        # -- files --
         if self.json_path is not None:
             s.setValue("files/last_json", str(self.json_path))
 
-        # -- window --
         s.setValue("window/geometry", self.saveGeometry())
         s.setValue("window/state", self.saveState())
         if hasattr(self, "_splitter"):
@@ -500,9 +499,20 @@ class SkyroomGUI(QMainWindow):
 
         outer.addWidget(self._build_action_bar())
 
+        # ---- نوار وضعیت با لینک دائمی گیت‌هاب ----
         self.status = QStatusBar()
         self.setStatusBar(self.status)
         self.status.showMessage("آماده")
+
+        repo_short = GITHUB_URL.replace("https://", "")
+        link = QLabel(
+            f'<a href="{GITHUB_URL}" style="color: #7a8ba8; '
+            f'text-decoration: none;">⭐ {repo_short}</a>'
+        )
+        link.setOpenExternalLinks(True)
+        link.setToolTip("باز کردن پروژه در گیت‌هاب")
+        link.setContentsMargins(0, 0, 8, 0)
+        self.status.addPermanentWidget(link)
 
     def _build_menu(self):
         menubar = self.menuBar()
@@ -535,7 +545,30 @@ class SkyroomGUI(QMainWindow):
         act_quit.triggered.connect(self.close)
         file_menu.addAction(act_quit)
 
+        # ---- منوی راهنما با لینک‌های گیت‌هاب ----
         help_menu = menubar.addMenu("&راهنما")
+
+        act_github = QAction("مشاهده در گیت‌هاب", self)
+        act_github.setShortcut("F1")
+        act_github.triggered.connect(
+            lambda: QDesktopServices.openUrl(QUrl(GITHUB_URL))
+        )
+        help_menu.addAction(act_github)
+
+        act_releases = QAction("بررسی به‌روزرسانی…", self)
+        act_releases.triggered.connect(
+            lambda: QDesktopServices.openUrl(QUrl(GITHUB_RELEASES))
+        )
+        help_menu.addAction(act_releases)
+
+        act_issues = QAction("گزارش مشکل…", self)
+        act_issues.triggered.connect(
+            lambda: QDesktopServices.openUrl(QUrl(GITHUB_ISSUES))
+        )
+        help_menu.addAction(act_issues)
+
+        help_menu.addSeparator()
+
         act_about = QAction("درباره", self)
         act_about.triggered.connect(self._about)
         help_menu.addAction(act_about)
@@ -1377,17 +1410,84 @@ class SkyroomGUI(QMainWindow):
         self.log_view.clear()
 
     # ---------------------------------------------------------
+    # درباره / معرفی پروژه
+    # ---------------------------------------------------------
     def _about(self):
         s = settings()
         path = s.fileName()
-        QMessageBox.about(
-            self, "درباره",
-            "مدیریت ربات اسکای‌روم\n\n"
-            "ورود خودکار به کلاس‌ها با مرورگر ناشناس (incognito).\n"
-            "تمام زمان‌ها بر اساس منطقه زمانی آسیا/تهران.\n"
-            "هر جلسه در زمان پایان کلاس به صورت خودکار بسته می‌شود.\n\n"
-            f"تنظیمات در این مسیر ذخیره می‌شوند:\n{path}"
+
+        html = f"""
+        <h2 style="margin: 0 0 4px 0;">{APP_NAME}</h2>
+        <p style="color: #888; margin: 0 0 12px 0;">
+          نسخه {APP_VERSION}
+        </p>
+
+        <p>
+          ورود خودکار به کلاس‌های آنلاین اسکای‌روم با مرورگر ناشناس (incognito).
+          ربات اتصال زنده را زیر نظر می‌گیرد و می‌تواند بین کلاس‌ها
+          لپ‌تاپ را به خواب ببرد و در زمان مقرر بیدار کند.
+        </p>
+
+        <p>
+          <b>صفحه پروژه:</b>
+          <a href="{GITHUB_URL}">{GITHUB_URL}</a><br/>
+          <b>آخرین نسخه:</b>
+          <a href="{GITHUB_RELEASES}">{GITHUB_RELEASES}</a><br/>
+          <b>گزارش مشکل:</b>
+          <a href="{GITHUB_ISSUES}">ثبت یک issue جدید</a>
+        </p>
+
+        <p style="color: #888; font-size: 11px;">
+          فایل تنظیمات:<br/>
+          <code>{path}</code>
+        </p>
+        """
+
+        box = QMessageBox(self)
+        box.setWindowTitle(f"درباره {APP_NAME}")
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(html)
+        for label in box.findChildren(QLabel):
+            label.setOpenExternalLinks(True)
+            label.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextBrowserInteraction
+            )
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.button(QMessageBox.StandardButton.Ok).setText("تایید")
+        box.exec()
+
+    def _maybe_show_star_hint(self):
+        """
+        یک‌بار، پس از اولین اجرا و ۴ ثانیه انتظار، از کاربر می‌پرسد
+        که آیا مخزن را ستاره می‌دهد یا نه. دیگر تکرار نمی‌شود.
+        """
+        s = settings()
+        if s.value("promo/star_hint_shown", False, type=bool):
+            return
+
+        first_run = s.value("promo/first_run", "", type=str)
+        if not first_run:
+            # این اولین اجراست — فقط ثبت می‌کنیم و پیام را برای اجرای بعد می‌گذاریم
+            s.setValue("promo/first_run",
+                       datetime.now(TEHRAN_TZ).isoformat())
+            s.sync()
+            return
+
+        s.setValue("promo/star_hint_shown", True)
+        s.sync()
+
+        r = QMessageBox.question(
+            self,
+            f"از {APP_NAME} راضی هستید؟",
+            "اگر این برنامه باعث می‌شود خودتان دستی وارد کلاس‌ها نشوید، "
+            "لطفاً با ستاره دادن به پروژه در گیت‌هاب از آن حمایت کنید. "
+            "این کار به دیده‌شدن آن توسط بقیه دانشجوها کمک می‌کند.\n\n"
+            "الان مخزن را باز کنید؟",
+            QMessageBox.StandardButton.Yes |
+            QMessageBox.StandardButton.No,
         )
+        if r == QMessageBox.StandardButton.Yes:
+            QDesktopServices.openUrl(QUrl(GITHUB_URL))
 
     def closeEvent(self, event):
         if self.bot is not None:
@@ -1420,7 +1520,7 @@ def main():
     app.setApplicationName("Skyroom Bot")
     app.setOrganizationName(SETTINGS_ORG)
     app.setStyle("Fusion")
-    
+
     # ---- application icon ----
     if getattr(sys, 'frozen', False):
         icon_path = Path(sys._MEIPASS) / 'assets' / 'icon-512.png'
@@ -1428,7 +1528,7 @@ def main():
         icon_path = Path(__file__).parent / 'assets' / 'icon-512.png'
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
-        
+
     window = SkyroomGUI()
 
     if "--json" in sys.argv:
