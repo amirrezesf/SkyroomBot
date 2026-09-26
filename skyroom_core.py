@@ -6,7 +6,9 @@ Each class has a start time and an end time on the same Persian weekday.
 """
 
 import os
+from pathlib import Path
 import random
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -467,6 +469,20 @@ class SkyroomBot:
         self._log("ERROR", f"{tag} giving up after {self.cfg.max_restarts} attempts")
 
     # ----- driver + clicks -----
+    def get_chromedriver_path(self):
+        if getattr(sys, 'frozen', False):
+            base = Path(sys._MEIPASS)
+            name = 'chromedriver.exe' if sys.platform == 'win32' else 'chromedriver'
+            p = base / 'drivers' / name
+            if p.exists():
+                return str(p)
+        # dev mode
+        local = Path(__file__).parent / 'drivers' / (
+            'chromedriver.exe' if sys.platform == 'win32' else 'chromedriver')
+        if local.exists():
+            return str(local)
+        return None    # fall back to Selenium Manager
+
     def _build_driver(self) -> webdriver.Chrome:
         path = self.cfg.chromedriver_path
         if not os.path.isfile(path):
@@ -481,7 +497,14 @@ class SkyroomBot:
         opts.add_experimental_option("excludeSwitches", ["enable-automation"])
         opts.add_experimental_option("useAutomationExtension", False)
 
+        path = self.get_chromedriver_path()
+        if path:
+            service = Service(executable_path=path)
+            driver = webdriver.Chrome(service=service, options=opts)
+        else:
+            driver = webdriver.Chrome(options=opts)  
         service = Service(executable_path=path)
+        
         driver = webdriver.Chrome(service=service, options=opts)
         driver.set_page_load_timeout(self.cfg.page_load_timeout)
 

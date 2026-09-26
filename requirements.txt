@@ -1,2 +1,2 @@
-PyQt6
-selenium
+PyQt6>=6.6
+selenium>=4.15

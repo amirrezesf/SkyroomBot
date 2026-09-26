@@ -64,36 +64,19 @@ import sys
 from pathlib import Path
 
 def get_chromedriver_path():
-    """
-    Locate the chromedriver, whether running from source or a PyInstaller bundle.
-    """
-    # 1. Check if we're running as a frozen executable
     if getattr(sys, 'frozen', False):
-        # PyInstaller creates a temp folder and stores the path in _MEIPASS
-        base_path = Path(sys._MEIPASS)
-        # The spec file puts drivers in a 'drivers' folder
-        driver_name = 'chromedriver.exe' if sys.platform == 'win32' else 'chromedriver'
-        driver_path = base_path / 'drivers' / driver_name
-        if driver_path.exists():
-            return str(driver_path)
-    
-    # 2. Check for a local 'drivers' folder (development mode)
-    local_driver = Path(__file__).parent / 'drivers' / ('chromedriver.exe' if sys.platform == 'win32' else 'chromedriver')
-    if local_driver.exists():
-        return str(local_driver)
-    
-    # 3. Fallback: use Selenium Manager (built into Selenium 4.6+)
-    # It will attempt to download the driver automatically.
-    return None  # Returning None tells Selenium to use its manager
+        base = Path(sys._MEIPASS)
+        name = 'chromedriver.exe' if sys.platform == 'win32' else 'chromedriver'
+        p = base / 'drivers' / name
+        if p.exists():
+            return str(p)
+    # dev mode
+    local = Path(__file__).parent / 'drivers' / (
+        'chromedriver.exe' if sys.platform == 'win32' else 'chromedriver')
+    if local.exists():
+        return str(local)
+    return None    # fall back to Selenium Manager
 
-# In your _build_driver method, use:
-# driver_path = get_chromedriver_path()
-# if driver_path:
-#     service = Service(executable_path=driver_path)
-#     driver = webdriver.Chrome(service=service, options=opts)
-# else:
-#     # Selenium Manager will handle it
-#     driver = webdriver.Chrome(options=opts)
 
 # ============================================================
 # Fonts & colours
