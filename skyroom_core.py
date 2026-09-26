@@ -33,7 +33,14 @@ from selenium.webdriver.support.ui import WebDriverWait
 # ============================================================
 # Timezone & Persian day mapping
 # ============================================================
-TEHRAN_TZ = ZoneInfo("Asia/Tehran")
+try:
+    from zoneinfo import ZoneInfo
+    TEHRAN_TZ = ZoneInfo("Asia/Tehran")
+except Exception:
+    # Fallback: Tehran is UTC+3:30 year-round since 2022
+    # (Iran abolished DST in September 2022)
+    from datetime import timezone, timedelta
+    TEHRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 
 # Python weekday: Monday=0 ... Sunday=6
 PERSIAN_DAYS = {
