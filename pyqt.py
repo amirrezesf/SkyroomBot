@@ -917,7 +917,12 @@ class SkyroomGUI(QMainWindow):
         w = QWidget()
         form = QFormLayout(w)
         form.setContentsMargins(12, 12, 12, 12)
+        self.v_json_path = QLineEdit()
+        self.v_json_path.setReadOnly(True)
+        self.v_json_path.setPlaceholderText("فایلی بارگذاری نشده")
+        self.v_json_path.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
 
+        form.addRow("فایل کاربران:", self.v_json_path)
         self.v_chromedriver = QLineEdit(self.cfg.chromedriver_path)
         self.v_chromedriver.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
         form.addRow("مسیر chromedriver:", self.v_chromedriver)
