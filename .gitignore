@@ -2,5 +2,9 @@ Lvenv/
 venv/
 venv
 Lvenv
-__pycache__
+__pycache__/
+*.pyc
+drivers/
+dist/
+build/
 info.md

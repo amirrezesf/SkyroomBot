@@ -633,9 +633,10 @@ class SkyroomGUI(QMainWindow):
     # =========================================================
     def _load_config_from_settings(self) -> RuntimeConfig:
         s = settings()
+        bundled = get_chromedriver_path() or ""
         return RuntimeConfig(
             chromedriver_path=s.value("chromedriver_path",
-                                      "/usr/bin/chromedriver", type=str),
+                                      bundled, type=str),
             send_message=s.value("send_message", True, type=bool),
             chat_message=s.value("chat_message", "سلام", type=str),
             page_load_timeout=s.value("page_load_timeout", 60, type=int),
@@ -923,8 +924,11 @@ class SkyroomGUI(QMainWindow):
         self.v_json_path.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
 
         form.addRow("فایل کاربران:", self.v_json_path)
-        self.v_chromedriver = QLineEdit(self.cfg.chromedriver_path)
+        self.v_chromedriver = QLineEdit(
+            self.cfg.chromedriver_path or get_chromedriver_path() or "")
         self.v_chromedriver.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        self.v_chromedriver.setPlaceholderText(
+            "خالی = خودکار (درایور داخلی، بدون نیاز به تنظیم دستی)")
         form.addRow("مسیر chromedriver:", self.v_chromedriver)
 
         self.v_send_message = QCheckBox("ارسال پیام در هنگام ورود")

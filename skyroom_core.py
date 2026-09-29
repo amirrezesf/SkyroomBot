@@ -491,9 +491,16 @@ class SkyroomBot:
         return None    # fall back to Selenium Manager
 
     def _build_driver(self) -> webdriver.Chrome:
-        path = self.cfg.chromedriver_path
-        if not os.path.isfile(path):
-            raise WebDriverException(f"chromedriver not found at {path!r}")
+        # Resolution order: explicit user path -> bundled driver -> PATH ->
+        # Selenium Manager (auto-download). The user never needs to set up
+        # chromedriver manually: the release binaries ship one under drivers/.
+        candidates: list[str] = []
+        manual = (self.cfg.chromedriver_path or "").strip()
+        if manual:
+            candidates.append(manual)
+        bundled = self.get_chromedriver_path()
+        if bundled and bundled not in candidates:
+            candidates.append(bundled)
 
         opts = Options()
         opts.add_argument("--incognito")
@@ -504,15 +511,29 @@ class SkyroomBot:
         opts.add_experimental_option("excludeSwitches", ["enable-automation"])
         opts.add_experimental_option("useAutomationExtension", False)
 
-        path = self.get_chromedriver_path()
-        if path:
-            service = Service(executable_path=path)
-            driver = webdriver.Chrome(service=service, options=opts)
+        last_err: Optional[Exception] = None
+        for path in candidates:
+            if not os.path.isfile(path):
+                continue
+            try:
+                service = Service(executable_path=path)
+                driver = webdriver.Chrome(service=service, options=opts)
+                break
+            except WebDriverException as e:
+                last_err = e
+                continue
         else:
-            driver = webdriver.Chrome(options=opts)  
-        service = Service(executable_path=path)
-        
-        driver = webdriver.Chrome(service=service, options=opts)
+            # No usable bundled/manual driver (or none present): fall back to
+            # Selenium Manager, which resolves/downloads a matching driver.
+            try:
+                driver = webdriver.Chrome(options=opts)
+            except WebDriverException as e:
+                hint = f" (tried bundled/manual drivers too: {last_err})" if last_err else ""
+                raise WebDriverException(
+                    "Could not start Chrome: no bundled chromedriver found and "
+                    f"Selenium Manager failed: {e}{hint}. "
+                    "Make sure Google Chrome is installed."
+                )
         driver.set_page_load_timeout(self.cfg.page_load_timeout)
 
         driver.execute_cdp_cmd(
