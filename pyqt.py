@@ -226,21 +226,6 @@ def settings() -> QSettings:
     return QSettings(SETTINGS_ORG, SETTINGS_APP)
 
 
-def get_chromedriver_path():
-    if getattr(sys, 'frozen', False):
-        base = Path(sys._MEIPASS)
-        name = 'chromedriver.exe' if sys.platform == 'win32' else 'chromedriver'
-        p = base / 'drivers' / name
-        if p.exists():
-            return str(p)
-    # dev mode
-    local = Path(__file__).parent / 'drivers' / (
-        'chromedriver.exe' if sys.platform == 'win32' else 'chromedriver')
-    if local.exists():
-        return str(local)
-    return None    # fall back to Selenium Manager
-
-
 # ============================================================
 # Fonts & colours
 # ============================================================
@@ -633,10 +618,7 @@ class SkyroomGUI(QMainWindow):
     # =========================================================
     def _load_config_from_settings(self) -> RuntimeConfig:
         s = settings()
-        bundled = get_chromedriver_path() or ""
         return RuntimeConfig(
-            chromedriver_path=s.value("chromedriver_path",
-                                      bundled, type=str),
             send_message=s.value("send_message", True, type=bool),
             chat_message=s.value("chat_message", "سلام", type=str),
             page_load_timeout=s.value("page_load_timeout", 60, type=int),
@@ -693,7 +675,6 @@ class SkyroomGUI(QMainWindow):
         s = settings()
         cfg = self._collect_config()
 
-        s.setValue("chromedriver_path", cfg.chromedriver_path)
         s.setValue("send_message", cfg.send_message)
         s.setValue("chat_message", cfg.chat_message)
         s.setValue("page_load_timeout", cfg.page_load_timeout)
@@ -924,12 +905,6 @@ class SkyroomGUI(QMainWindow):
         self.v_json_path.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
 
         form.addRow("فایل کاربران:", self.v_json_path)
-        self.v_chromedriver = QLineEdit(
-            self.cfg.chromedriver_path or get_chromedriver_path() or "")
-        self.v_chromedriver.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
-        self.v_chromedriver.setPlaceholderText(
-            "خالی = خودکار (درایور داخلی، بدون نیاز به تنظیم دستی)")
-        form.addRow("مسیر chromedriver:", self.v_chromedriver)
 
         self.v_send_message = QCheckBox("ارسال پیام در هنگام ورود")
         self.v_send_message.setChecked(self.cfg.send_message)
@@ -1160,7 +1135,6 @@ class SkyroomGUI(QMainWindow):
 
     def _collect_config(self) -> RuntimeConfig:
         return RuntimeConfig(
-            chromedriver_path=self.v_chromedriver.text().strip(),
             send_message=self.v_send_message.isChecked(),
             chat_message=self.v_chat_message.text().strip() or "سلام",
             page_load_timeout=self.v_page_timeout.value(),
@@ -1386,24 +1360,11 @@ class SkyroomGUI(QMainWindow):
 
         cfg = self._collect_config().effective()
 
-        # Empty path = auto mode (bundled driver -> Selenium Manager).
-        # Don't block Start here; resolution happens in the worker with
-        # log output, since the driver is only needed at join time.
-        # Just normalize: if the user typed a path, keep it; otherwise
-        # leave empty so SkyroomBot resolves the bundled driver.
-        if not cfg.chromedriver_path:
-            auto = get_chromedriver_path()
-            if auto:
-                self._append_log(
-                    "INFO",
-                    f"درایور داخلی پیدا شد: {auto} — بدون نیاز به تنظیم دستی",
-                )
-            else:
-                self._append_log(
-                    "INFO",
-                    "درایور داخلی یافت نشد — در زمان ورود، نسخه سازگار "
-                    "به‌صورت خودکار دانلود می‌شود (نیاز به اینترنت، فقط بار اول)",
-                )
+        self._append_log(
+            "INFO",
+            "درایور مرورگر به‌صورت خودکار انتخاب می‌شود "
+            "(درایور داخلی، سپس نسخه سازگار — نیاز به اینترنت فقط بار اول)",
+        )
 
         self.bot = SkyroomBot(cfg, self.users, self._emit_log)
 
