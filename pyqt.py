@@ -1386,12 +1386,24 @@ class SkyroomGUI(QMainWindow):
 
         cfg = self._collect_config().effective()
 
-        if not Path(cfg.chromedriver_path).is_file():
-            QMessageBox.critical(
-                self, "خطا",
-                f"chromedriver در مسیر زیر پیدا نشد:\n{cfg.chromedriver_path}",
-            )
-            return
+        # Empty path = auto mode (bundled driver -> Selenium Manager).
+        # Don't block Start here; resolution happens in the worker with
+        # log output, since the driver is only needed at join time.
+        # Just normalize: if the user typed a path, keep it; otherwise
+        # leave empty so SkyroomBot resolves the bundled driver.
+        if not cfg.chromedriver_path:
+            auto = get_chromedriver_path()
+            if auto:
+                self._append_log(
+                    "INFO",
+                    f"درایور داخلی پیدا شد: {auto} — بدون نیاز به تنظیم دستی",
+                )
+            else:
+                self._append_log(
+                    "INFO",
+                    "درایور داخلی یافت نشد — در زمان ورود، نسخه سازگار "
+                    "به‌صورت خودکار دانلود می‌شود (نیاز به اینترنت، فقط بار اول)",
+                )
 
         self.bot = SkyroomBot(cfg, self.users, self._emit_log)
 

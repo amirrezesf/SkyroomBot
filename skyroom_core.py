@@ -518,15 +518,24 @@ class SkyroomBot:
             try:
                 service = Service(executable_path=path)
                 driver = webdriver.Chrome(service=service, options=opts)
+                self._log("INFO", f"using chromedriver: {path}")
                 break
             except WebDriverException as e:
                 last_err = e
+                self._log("WARNING",
+                          f"bundled/manual driver failed ({path}): {e} — "
+                          "trying next option")
                 continue
         else:
             # No usable bundled/manual driver (or none present): fall back to
             # Selenium Manager, which resolves/downloads a matching driver.
+            self._log("INFO",
+                      "no usable bundled chromedriver — Selenium Manager "
+                      "will download the matching version "
+                      "(needs internet, first run only)…")
             try:
                 driver = webdriver.Chrome(options=opts)
+                self._log("INFO", "Selenium Manager provided a driver")
             except WebDriverException as e:
                 hint = f" (tried bundled/manual drivers too: {last_err})" if last_err else ""
                 raise WebDriverException(
