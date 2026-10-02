@@ -713,6 +713,364 @@ class JarvisBridge(QObject):
     decision = pyqtSignal(object)
     pending_added = pyqtSignal(int, str)
     pending_removed = pyqtSignal(int)
+
+# ============================================================
+# Jarvis settings dialog
+# ============================================================
+JARVIS_CONFIG_PATH = Path.home() / ".jarvis" / "config.json"
+
+_ACTION_CHOICES = ["type_number", "send_chat", "notify_me"]
+
+
+class JarvisConfigDialog(QDialog):
+    """Edit ~/.jarvis/config.json from inside the GUI."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("تنظیمات جارویس")
+        self.setModal(True)
+        self.resize(720, 620)
+
+        self._data: dict = {}
+        self._widgets: dict = {}
+
+        self._load()
+        self._build_ui()
+
+    # ------------------------------------------------------------------
+    def _load(self) -> None:
+        from jarvis.core import config_loader
+        from jarvis import config as jcfg
+
+        if not JARVIS_CONFIG_PATH.exists():
+            config_loader.load(jcfg.__dict__)
+
+        try:
+            self._data = json.loads(
+                JARVIS_CONFIG_PATH.read_text(encoding="utf-8")
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "جارویس",
+                                f"خواندن فایل ناموفق:\n{e}")
+            self._data = {}
+
+    # ------------------------------------------------------------------
+    def _line(self, key: str, hint: str = "") -> QLineEdit:
+        w = QLineEdit(str(self._data.get(key, "")))
+        w.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        if hint:
+            w.setPlaceholderText(hint)
+        self._widgets[key] = w
+        return w
+
+    def _password(self, key: str) -> QLineEdit:
+        w = QLineEdit(str(self._data.get(key, "")))
+        w.setEchoMode(QLineEdit.EchoMode.Password)
+        w.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        self._widgets[key] = w
+        return w
+
+    def _check(self, key: str) -> QCheckBox:
+        w = QCheckBox()
+        w.setChecked(bool(self._data.get(key, False)))
+        self._widgets[key] = w
+        return w
+    
+    def _monitor_combo(self, key: str) -> QWidget:
+        """Editable combo populated from pactl, with a refresh button."""
+        try:
+            from jarvis.audio.monitor import list_monitor_sources
+            sources = list_monitor_sources()
+        except Exception:
+            sources = []
+
+        box = QWidget()
+        layout = QHBoxLayout(box)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+
+        current = str(self._data.get(key, ""))
+        if current and current not in sources:
+            combo.addItem(current)
+        for s in sources:
+            combo.addItem(s)
+        if current:
+            combo.setCurrentText(current)
+
+        self._widgets[key] = combo
+        layout.addWidget(combo, 1)
+
+        def refresh():
+            try:
+                from jarvis.audio.monitor import list_monitor_sources as lm
+                new_sources = lm()
+            except Exception:
+                new_sources = []
+            text = combo.currentText()
+            combo.clear()
+            if text and text not in new_sources:
+                combo.addItem(text)
+            for s in new_sources:
+                combo.addItem(s)
+            combo.setCurrentText(text)
+
+        btn = QPushButton("↻")
+        btn.setToolTip("به‌روزرسانی لیست دستگاه‌ها")
+        btn.setFixedWidth(32)
+        apply_button_style(btn, "neutral")
+        btn.clicked.connect(refresh)
+        layout.addWidget(btn)
+
+        return box
+    def _combo(self, key: str, choices: list) -> QComboBox:
+        w = QComboBox()
+        for c in choices:
+            w.addItem(c)
+        current = str(self._data.get(key, choices[0] if choices else ""))
+        if current in choices:
+            w.setCurrentText(current)
+        self._widgets[key] = w
+        return w
+
+    def _checkgroup(self, key: str) -> dict:
+        """Multi-checkbox for a list-of-strings field."""
+        current = set(self._data.get(key, []) or [])
+        group: dict = {}
+        box = QWidget()
+        layout = QHBoxLayout(box)
+        layout.setContentsMargins(0, 0, 0, 0)
+        for choice in _ACTION_CHOICES:
+            cb = QCheckBox(choice)
+            cb.setChecked(choice in current)
+            layout.addWidget(cb)
+            group[choice] = cb
+        layout.addStretch(1)
+        self._widgets[key] = group
+        return {"widget": box, "group": group}
+
+    # ------------------------------------------------------------------
+    def _build_ui(self) -> None:
+        outer = QVBoxLayout(self)
+
+        tabs = QTabWidget()
+        tabs.addTab(self._tab_models(), "مدل و صوت")
+        tabs.addTab(self._tab_extraction(), "استخراج")
+        tabs.addTab(self._tab_actions(), "اکشن‌ها و هشدار")
+        outer.addWidget(tabs, 1)
+
+        # footer
+        footer = QHBoxLayout()
+        open_raw = QPushButton("باز کردن فایل خام")
+        apply_button_style(open_raw, "neutral")
+        open_raw.clicked.connect(self._open_raw)
+        footer.addWidget(open_raw)
+
+        reset = QPushButton("بازگردانی به پیش‌فرض")
+        apply_button_style(reset, "neutral")
+        reset.clicked.connect(self._reset_defaults)
+        footer.addWidget(reset)
+        footer.addStretch(1)
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save |
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.button(QDialogButtonBox.StandardButton.Save).setText("ذخیره")
+        bb.button(QDialogButtonBox.StandardButton.Cancel).setText("انصراف")
+        bb.accepted.connect(self._save)
+        bb.rejected.connect(self.reject)
+        footer.addWidget(bb)
+
+        outer.addLayout(footer)
+
+    # ------------------------------------------------------------------
+    def _tab_models(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        w = QWidget()
+        form = QFormLayout(w)
+        form.setContentsMargins(12, 12, 12, 12)
+
+        form.addRow("مدل ویشپر:",
+                    self._line("WHISPER_MODEL",
+                               "large-v3-turbo یا مسیر کامل"))
+        form.addRow("دستگاه:",
+                    self._combo("DEVICE", ["cuda", "cpu"]))
+        form.addRow("نوع محاسبه:",
+                    self._combo("COMPUTE_TYPE",
+                                ["float16", "int8_float16", "int8",
+                                 "float32"]))
+        form.addRow("زبان:", self._line("LANGUAGE", "fa / en / خالی"))
+        form.addRow("دستگاه ضبط سیستم:", self._monitor_combo("LOOPBACK_DEVICE"))
+        hint = QLabel(
+            "برای تغییر مدل ویشپر به مسیر کامل فایل‌های CTranslate2 یا "
+            "نام مدل هاگینگ‌فیس نیاز است. تغییر زبان تنها روی مدل‌های "
+            "چندزبانه اثر دارد.\n\n"
+            "دستگاه ضبط سیستم از میان منابع monitor موجود انتخاب می‌شود. "
+            "دکمهٔ ↻ فهرست را دوباره می‌خواند. تغییر آن فقط پس از "
+            "راه‌اندازی مجدد جارویس (شروع کلاس بعدی) اعمال می‌شود."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: gray; font-size: 11px;")
+        form.addRow("", hint)
+
+        scroll.setWidget(w)
+        return scroll
+
+    def _tab_extraction(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        w = QWidget()
+        form = QFormLayout(w)
+        form.setContentsMargins(12, 12, 12, 12)
+
+        form.addRow("بک‌اند:",
+                    self._combo("EXTRACTION_BACKEND", ["local", "cloud"]))
+
+        form.addRow(QLabel("<b>محلی (Ollama)</b>"))
+        form.addRow("آدرس Ollama:",
+                    self._line("LOCAL_LLM_URL",
+                               "http://localhost:11434/v1"))
+        form.addRow("مدل محلی:",
+                    self._line("LOCAL_EXTRACTION_MODEL",
+                               "qwen2.5:3b"))
+
+        form.addRow(QLabel("<b>ابری (9Router)</b>"))
+        form.addRow("آدرس 9Router:",
+                    self._line("NINEROUTER_URL",
+                               "http://localhost:20128/v1"))
+        form.addRow("کلید API:", self._password("NINEROUTER_KEY"))
+        form.addRow("نام مدل ابری:", self._line("EXTRACTION_MODEL"))
+        form.addRow("کومبو:", self._line("NINEROUTER_COMBO_NAME"))
+
+        scroll.setWidget(w)
+        return scroll
+
+    def _tab_actions(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        w = QWidget()
+        form = QFormLayout(w)
+        form.setContentsMargins(12, 12, 12, 12)
+
+        form.addRow("اجرای اکشن‌ها فعال:",
+                    self._check("ACTION_EXECUTION_ENABLED"))
+        form.addRow("حالت آزمایشی (Dry run):",
+                    self._check("ACTION_DRY_RUN"))
+
+        box_req = self._checkgroup("ACTION_REQUIRE_CONFIRM")
+        form.addRow("نیاز به تایید برای:", box_req["widget"])
+
+        box_dis = self._checkgroup("ACTION_DISABLED")
+        form.addRow("اکشن‌های غیرفعال:", box_dis["widget"])
+
+        form.addRow(QLabel("<b>هشدار صوتی</b>"))
+        form.addRow("فعال:", self._check("ALARM_ENABLED"))
+        form.addRow("فایل صدا:",
+                    self._line("ALARM_SOUND_PATH",
+                               "default یا مسیر کامل"))
+
+        hint = QLabel(
+            "«default» یعنی از صدای همراه پکیج استفاده شود. "
+            "اگر «نیاز به تایید» خالی باشد، اکشن‌ها بدون تأیید اجرا "
+            "می‌شوند."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: gray; font-size: 11px;")
+        form.addRow("", hint)
+
+        scroll.setWidget(w)
+        return scroll
+
+    # ------------------------------------------------------------------
+    def _collect(self) -> dict:
+        out = {}
+        for key, w in self._widgets.items():
+            if isinstance(w, QLineEdit):
+                out[key] = w.text().strip()
+            elif isinstance(w, QCheckBox):
+                out[key] = w.isChecked()
+            elif isinstance(w, QComboBox):
+                out[key] = w.currentText()
+            elif isinstance(w, dict):
+                out[key] = [c for c, cb in w.items() if cb.isChecked()]
+        return out
+
+    def _save(self) -> None:
+        values = self._collect()
+
+        # Merge with the file already on disk, in case a field exists
+        # there that the dialog doesn't render.
+        merged = dict(self._data)
+        merged.update(values)
+
+        try:
+            JARVIS_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            JARVIS_CONFIG_PATH.write_text(
+                json.dumps(merged, ensure_ascii=False, indent=4) + "\n",
+                encoding="utf-8",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "جارویس",
+                                 f"ذخیره ناموفق:\n{e}")
+            return
+
+        # Reload into the running process so the next segment sees it.
+        try:
+            from jarvis.core import config_loader
+            from jarvis import config as jcfg
+            config_loader.reload_into(jcfg.__dict__)
+        except Exception as e:
+            QMessageBox.warning(
+                self, "جارویس",
+                f"فایل ذخیره شد ولی بارگذاری مجدد ناموفق بود:\n{e}\n\n"
+                "برای اعمال کامل، برنامه را دوباره باز کنید."
+            )
+
+        self.accept()
+
+    def _open_raw(self) -> None:
+        if not JARVIS_CONFIG_PATH.exists():
+            QMessageBox.information(self, "جارویس",
+                                    "فایل تنظیمات هنوز ساخته نشده است.")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(JARVIS_CONFIG_PATH)))
+
+    def _reset_defaults(self) -> None:
+        r = QMessageBox.question(
+            self, "بازگردانی",
+            "فایل تنظیمات جارویس حذف و مقادیر پیش‌فرض بازسازی شود؟",
+            QMessageBox.StandardButton.Yes |
+            QMessageBox.StandardButton.No,
+        )
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            JARVIS_CONFIG_PATH.unlink(missing_ok=True)
+        except Exception as e:
+            QMessageBox.critical(self, "جارویس", f"حذف ناموفق:\n{e}")
+            return
+        self._load()
+        # Rebuild the UI with the new values
+        for i in reversed(range(self.layout().count())):
+            item = self.layout().itemAt(i)
+            if item and item.widget():
+                item.widget().deleteLater()
+        while self.layout().count():
+            self.layout().takeAt(0)
+        self._widgets.clear()
+        self._build_ui()
+
 # ============================================================
 # Main window
 # ============================================================
@@ -1212,10 +1570,10 @@ class SkyroomGUI(QMainWindow):
         bar.addWidget(QLabel("وضعیت:"))
         bar.addWidget(self.jarvis_status, 1)
 
-        open_cfg = QPushButton("باز کردن فایل تنظیمات")
-        apply_button_style(open_cfg, "neutral")
-        open_cfg.clicked.connect(self._open_jarvis_config)
-        bar.addWidget(open_cfg)
+        settings_btn = QPushButton("تنظیمات")
+        apply_button_style(settings_btn, "start")
+        settings_btn.clicked.connect(self._open_jarvis_settings)
+        bar.addWidget(settings_btn)
         outer.addLayout(bar)
 
         if not JARVIS_AVAILABLE:
@@ -2488,26 +2846,16 @@ class SkyroomGUI(QMainWindow):
             fmt = QTextCharFormat()
             fmt.setForeground(QColor("#ffd166"))
             cursor.insertText(f"{prefix}id={pid}\n", fmt)
-
-    def _open_jarvis_config(self) -> None:
-        path = Path.home() / ".jarvis" / "config.json"
-        if not path.exists():
-            try:
-                from jarvis import config as _jcfg  # noqa: F401
-            except Exception as e:
-                QMessageBox.warning(
-                    self, "Jarvis",
-                    f"فایل تنظیمات ساخته نشد: {e}",
-                )
-                return
-        if not path.exists():
+    def _open_jarvis_settings(self) -> None:
+        if not JARVIS_AVAILABLE:
             QMessageBox.warning(
-                self, "Jarvis",
-                "فایل تنظیمات ساخته نشد. مطمئن شوید Jarvis نصب است.",
+                self, "جارویس",
+                "پکیج Jarvis نصب نیست؛ فایل تنظیمات در دسترس نیست.",
             )
             return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
-
+        dlg = JarvisConfigDialog(self)
+        if dlg.exec():
+            self._append_log("INFO", "تنظیمات جارویس ذخیره شد")
     def _clear_log(self):
         self.log_view.clear()
 
