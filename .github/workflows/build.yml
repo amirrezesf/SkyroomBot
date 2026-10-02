@@ -2,81 +2,114 @@ name: Build & Release
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, with_jarvis ]
     tags:     [ 'v*' ]
   workflow_dispatch:
+    inputs:
+      build_base:
+        description: 'Build base variant (main branch)'
+        type: boolean
+        default: true
+      build_full:
+        description: 'Build full variant (with_jarvis branch)'
+        type: boolean
+        default: true
 
 permissions:
   contents: write
 
 jobs:
   # =========================================================
-  # 0) Guard + version determination
+  # 0) Guard: decide what to build, compute version
   # =========================================================
   guard:
-    name: Check trigger and compute version
+    name: Decide what to build
     runs-on: ubuntu-latest
     outputs:
-      should_build: ${{ steps.check.outputs.should_build }}
+      should_run:   ${{ steps.decide.outputs.should_run }}
       version:      ${{ steps.ver.outputs.version }}
       version_nov:  ${{ steps.ver.outputs.version_nov }}
+      build_base:   ${{ steps.decide.outputs.build_base }}
+      build_full:   ${{ steps.decide.outputs.build_full }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Decide whether to build
-        id: check
+      - name: Decide what to build
+        id: decide
         shell: bash
         run: |
+          set -e
           MSG="${{ github.event.head_commit.message }}"
           REF_TYPE="${{ github.ref_type }}"
           EVENT="${{ github.event_name }}"
 
-          RUN="false"
+          BUILD_BASE="false"
+          BUILD_FULL="false"
 
-          if [[ "$REF_TYPE" == "tag" ]]; then
-            RUN="true"
-            echo "Triggered by tag push"
-          fi
           if [[ "$EVENT" == "workflow_dispatch" ]]; then
-            RUN="true"
-            echo "Triggered manually"
-          fi
-          if echo "$MSG" | grep -q '\[build\]'; then
-            RUN="true"
-            echo "Triggered by [build] keyword"
-          fi
-          if echo "$MSG" | grep -q '\[skip ci\]'; then
-            RUN="false"
-            echo "Skipped due to [skip ci]"
+            BUILD_BASE="${{ inputs.build_base }}"
+            BUILD_FULL="${{ inputs.build_full }}"
+            echo "Manual dispatch: base=$BUILD_BASE full=$BUILD_FULL"
+          elif [[ "$REF_TYPE" == "tag" ]]; then
+            BUILD_BASE="true"
+            BUILD_FULL="true"
+            echo "Tag push: building both"
+          else
+            if echo "$MSG" | grep -q '\[skip ci\]'; then
+              BUILD_BASE="false"
+              BUILD_FULL="false"
+              echo "Skipped due to [skip ci]"
+            elif echo "$MSG" | grep -q '\[build\]'; then
+              BUILD_BASE="true"
+              BUILD_FULL="true"
+              echo "Triggered by [build]: both variants"
+            else
+              if echo "$MSG" | grep -q '\[build-base\]'; then
+                BUILD_BASE="true"
+              fi
+              if echo "$MSG" | grep -q '\[build-full\]'; then
+                BUILD_FULL="true"
+              fi
+            fi
           fi
 
-          echo "should_build=$RUN" >> "$GITHUB_OUTPUT"
-          echo "Final decision: $RUN"
+          if [[ "$BUILD_BASE" == "false" && "$BUILD_FULL" == "false" ]]; then
+            echo "should_run=false"
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "build_base=false" >> "$GITHUB_OUTPUT"
+            echo "build_full=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "should_run=true"
+          echo "should_run=true" >> "$GITHUB_OUTPUT"
+          echo "build_base=$BUILD_BASE" >> "$GITHUB_OUTPUT"
+          echo "build_full=$BUILD_FULL" >> "$GITHUB_OUTPUT"
 
       - name: Determine version
         id: ver
         shell: bash
         run: |
+          set -e
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             TAG="${GITHUB_REF_NAME}"
           else
             BASE=$(cat VERSION | tr -d '[:space:]')
             TAG="v${BASE}.${GITHUB_RUN_NUMBER}"
           fi
-          # strip leading 'v' for filenames if you prefer no-v;
-          # here we keep it, so version == tag.
-          echo "version=$TAG"     >> "$GITHUB_OUTPUT"
-          echo "version_nov=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "version=$TAG"           >> "$GITHUB_OUTPUT"
+          echo "version_nov=${TAG#v}"   >> "$GITHUB_OUTPUT"
           echo "Resolved version: $TAG"
 
   # =========================================================
-  # 1) Build
+  # 1) Build — one job per (os, variant) that is requested
   # =========================================================
   build:
-    name: Build on ${{ matrix.os }}
+    name: Build ${{ matrix.variant }} on ${{ matrix.os }}
     needs: guard
-    if: needs.guard.outputs.should_build == 'true'
+    if: needs.guard.outputs.should_run == 'true'
     runs-on: ${{ matrix.os }}
 
     strategy:
@@ -86,31 +119,74 @@ jobs:
           - os: ubuntu-latest
             platform: linux
             ext: ""
+            variant: base
+            branch: main
+          - os: ubuntu-latest
+            platform: linux
+            ext: ""
+            variant: full
+            branch: with_jarvis
           - os: windows-latest
             platform: windows
             ext: ".exe"
+            variant: base
+            branch: main
+          - os: windows-latest
+            platform: windows
+            ext: ".exe"
+            variant: full
+            branch: with_jarvis
 
     steps:
-      - name: Checkout
+      - name: Skip if this variant is not requested
+        id: gate
+        shell: bash
+        run: |
+          case "${{ matrix.variant }}" in
+            base) FLAG="${{ needs.guard.outputs.build_base }}" ;;
+            full) FLAG="${{ needs.guard.outputs.build_full }}" ;;
+            *)    FLAG="false" ;;
+          esac
+          echo "enabled=$FLAG" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout target branch
+        if: steps.gate.outputs.enabled == 'true'
         uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.branch }}
+          fetch-depth: 0
 
       - name: Setup Python
+        if: steps.gate.outputs.enabled == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: 'pip'
 
-      - name: Install dependencies
+      - name: Install base dependencies
+        if: steps.gate.outputs.enabled == 'true'
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
           python -m pip install pyinstaller
 
+      - name: Install Jarvis (full variant only)
+        if: |
+          steps.gate.outputs.enabled == 'true' &&
+          matrix.variant == 'full'
+        env:
+          JARVIS_REF: v0.1.0
+        run: |
+          pip install "git+https://github.com/amirrezesf/Jarvis.git@${JARVIS_REF}"
+
       - name: Download matching chromedriver
+        if: steps.gate.outputs.enabled == 'true'
         run: python scripts/download_chromedriver.py
 
       - name: Install Linux runtime libraries (Qt)
-        if: matrix.os == 'ubuntu-latest'
+        if: |
+          steps.gate.outputs.enabled == 'true' &&
+          matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -119,60 +195,71 @@ jobs:
             libxcb-shape0 libxcb-xinerama0
 
       - name: Build with PyInstaller
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          BUILD_VARIANT: ${{ matrix.variant }}
         run: python -m PyInstaller --clean --noconfirm skyroom_bot.spec
 
-      - name: Rename output to final release name
+      - name: Rename output
+        if: steps.gate.outputs.enabled == 'true'
         shell: bash
         run: |
           set -e
           VERSION="${{ needs.guard.outputs.version }}"
           PLATFORM="${{ matrix.platform }}"
+          VARIANT="${{ matrix.variant }}"
           EXT="${{ matrix.ext }}"
-          FINAL="SkyroomBot-${VERSION}-${PLATFORM}-x64${EXT}"
-
+          FINAL="SkyroomBot-${VERSION}-${PLATFORM}-x64-${VARIANT}${EXT}"
           cd dist
           mv "SkyroomBot${EXT}" "$FINAL"
           echo "Final name: $FINAL"
           ls -la
 
       - name: Make Linux binary executable
-        if: matrix.os == 'ubuntu-latest'
+        if: |
+          steps.gate.outputs.enabled == 'true' &&
+          matrix.os == 'ubuntu-latest'
         shell: bash
         run: |
-          chmod +x dist/SkyroomBot-${{ needs.guard.outputs.version }}-linux-x64
+          chmod +x "dist/SkyroomBot-${{ needs.guard.outputs.version }}-linux-x64-${{ matrix.variant }}"
 
       - name: Smoke test (Linux)
-        if: matrix.os == 'ubuntu-latest'
+        if: |
+          steps.gate.outputs.enabled == 'true' &&
+          matrix.os == 'ubuntu-latest'
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          BIN="dist/SkyroomBot-${{ needs.guard.outputs.version }}-linux-x64"
+          BIN="dist/SkyroomBot-${{ needs.guard.outputs.version }}-linux-x64-${{ matrix.variant }}"
           test -f "$BIN" && echo "binary exists"
           timeout 10 "$BIN" || true
 
       - name: Smoke test (Windows)
-        if: matrix.os == 'windows-latest'
+        if: |
+          steps.gate.outputs.enabled == 'true' &&
+          matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          $bin = "dist/SkyroomBot-${{ needs.guard.outputs.version }}-windows-x64.exe"
+          $bin = "dist/SkyroomBot-${{ needs.guard.outputs.version }}-windows-x64-${{ matrix.variant }}.exe"
           if (-not (Test-Path $bin)) { throw "binary not built: $bin" }
           Write-Host "binary exists"
 
       - name: Upload binary
+        if: steps.gate.outputs.enabled == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: build-${{ matrix.platform }}
-          path: dist/SkyroomBot-*-${{ matrix.platform }}-x64${{ matrix.ext }}
+          name: build-${{ matrix.platform }}-${{ matrix.variant }}
+          path: dist/SkyroomBot-*-${{ matrix.platform }}-x64-${{ matrix.variant }}${{ matrix.ext }}
           if-no-files-found: error
 
   # =========================================================
-  # 2) Release
+  # 2) Release — combine fresh builds + carried-over variants
   # =========================================================
   release:
     name: Publish GitHub Release
     needs: [guard, build]
     if: |
-      needs.guard.outputs.should_build == 'true' &&
+      needs.guard.outputs.should_run == 'true' &&
       github.event_name == 'push'
     runs-on: ubuntu-latest
 
@@ -182,42 +269,120 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Download artifacts
+      - name: Download fresh artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Show files
-        run: find artifacts -type f -exec ls -lh {} \;
+      - name: Find previous release
+        id: prev
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          PREV=$(gh release list --limit 1 --json tagName \
+                 --jq '.[0].tagName // empty' 2>/dev/null || echo "")
+          if [[ -z "$PREV" ]]; then
+            echo "No previous release found."
+            PREV=""
+          else
+            echo "Previous release: $PREV"
+          fi
+          echo "tag=$PREV" >> "$GITHUB_OUTPUT"
+
+      - name: Carry over non-built variants
+        id: carry
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION:  ${{ needs.guard.outputs.version }}
+          PREV_TAG: ${{ steps.prev.outputs.tag }}
+          BUILD_BASE: ${{ needs.guard.outputs.build_base }}
+          BUILD_FULL: ${{ needs.guard.outputs.build_full }}
+        run: |
+          set -e
+          CARRIED_BASE="false"
+          CARRIED_FULL="false"
+
+          if [[ -z "$PREV_TAG" ]]; then
+            # First release ever: nothing to carry. If we were asked to
+            # not build a variant, that variant is simply missing from
+            # this first release.
+            echo "First release; nothing to carry."
+            echo "carried_base=false" >> "$GITHUB_OUTPUT"
+            echo "carried_full=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          mkdir -p artifacts/carried
+
+          if [[ "$BUILD_BASE" == "false" ]]; then
+            echo "Carrying base from $PREV_TAG"
+            gh release download "$PREV_TAG" \
+              -p "SkyroomBot-*-linux-x64-base" \
+              -p "SkyroomBot-*-windows-x64-base.exe" \
+              -D artifacts/carried 2>/dev/null || true
+            CARRIED_BASE="true"
+          fi
+
+          if [[ "$BUILD_FULL" == "false" ]]; then
+            echo "Carrying full from $PREV_TAG"
+            gh release download "$PREV_TAG" \
+              -p "SkyroomBot-*-linux-x64-full" \
+              -p "SkyroomBot-*-windows-x64-full.exe" \
+              -D artifacts/carried 2>/dev/null || true
+            CARRIED_FULL="true"
+          fi
+
+          # Rename carried files to the new version so the release is
+          # internally consistent.
+          if [[ -d artifacts/carried ]]; then
+            for f in artifacts/carried/SkyroomBot-*; do
+              [[ -e "$f" ]] || continue
+              base=$(basename "$f")
+              newname=$(echo "$base" | sed -E "s/SkyroomBot-[^-]+-(linux|windows)/SkyroomBot-${VERSION}-\1/")
+              mv "$f" "artifacts/carried/$newname"
+              echo "Renamed: $base -> $newname"
+            done
+          fi
+
+          echo "carried_base=$CARRIED_BASE" >> "$GITHUB_OUTPUT"
+          echo "carried_full=$CARRIED_FULL" >> "$GITHUB_OUTPUT"
+
+      - name: Consolidate artifacts into one directory
+        shell: bash
+        run: |
+          set -e
+          mkdir -p release
+          # Fresh builds live under artifacts/build-*; carried lives
+          # under artifacts/carried
+          find artifacts -type f \( \
+              -name 'SkyroomBot-*' -o -name 'SkyroomBot-*.exe' \) \
+            -exec cp -v {} release/ \;
+          ls -la release/
 
       - name: Generate checksums
         id: sums
         shell: bash
         run: |
           set -e
-          VERSION="${{ needs.guard.outputs.version }}"
-          WIN_FILE="SkyroomBot-${VERSION}-windows-x64.exe"
-          LINUX_FILE="SkyroomBot-${VERSION}-linux-x64"
+          cd release
+          sha256sum SkyroomBot-* > SHA256SUMS
+          cat SHA256SUMS
 
-          WIN_SHA=$(sha256sum "artifacts/build-windows/${WIN_FILE}" | awk '{print $1}')
-          LINUX_SHA=$(sha256sum "artifacts/build-linux/${LINUX_FILE}" | awk '{print $1}')
-          WIN_SIZE=$(du -h "artifacts/build-windows/${WIN_FILE}" | cut -f1)
-          LINUX_SIZE=$(du -h "artifacts/build-linux/${LINUX_FILE}" | cut -f1)
+          # Expose file names for the release body
+          LINUX_BASE=$(ls SkyroomBot-*-linux-x64-base 2>/dev/null || echo "")
+          LINUX_FULL=$(ls SkyroomBot-*-linux-x64-full 2>/dev/null || echo "")
+          WIN_BASE=$(ls SkyroomBot-*-windows-x64-base.exe 2>/dev/null || echo "")
+          WIN_FULL=$(ls SkyroomBot-*-windows-x64-full.exe 2>/dev/null || echo "")
 
           {
-            echo "win_sha=$WIN_SHA"
-            echo "linux_sha=$LINUX_SHA"
-            echo "win_size=$WIN_SIZE"
-            echo "linux_size=$LINUX_SIZE"
-            echo "win_file=$WIN_FILE"
-            echo "linux_file=$LINUX_FILE"
+            echo "linux_base=$LINUX_BASE"
+            echo "linux_full=$LINUX_FULL"
+            echo "win_base=$WIN_BASE"
+            echo "win_full=$WIN_FULL"
           } >> "$GITHUB_OUTPUT"
-
-          {
-            echo "$WIN_SHA  ${WIN_FILE}"
-            echo "$LINUX_SHA  ${LINUX_FILE}"
-          } > artifacts/SHA256SUMS
-          cat artifacts/SHA256SUMS
 
       - name: Build changelog
         id: changelog
@@ -225,8 +390,7 @@ jobs:
         run: |
           set -e
           TAG="${{ needs.guard.outputs.version }}"
-          PREV=$(git tag --sort=-v:refname | grep -E '^v[0-9]' \
-                 | grep -v "^${TAG}$" | head -n1 || true)
+          PREV="${{ steps.prev.outputs.tag }}"
 
           if [[ -z "$PREV" ]]; then
             RANGE="HEAD"
@@ -236,13 +400,11 @@ jobs:
             SINCE_TEXT="Changes since ${PREV}"
           fi
 
-          git log --pretty=format:'%s' "$RANGE" > /tmp/raw_commits.txt || true
+          git log --pretty=format:'%s' "$RANGE" > /tmp/raw.txt || true
 
-          FEATS=$(grep -E '^feat(\(|:|!| )'  /tmp/raw_commits.txt | sed 's/^/- /' || true)
-          FIXES=$(grep -E '^fix(\(|:|!| )'   /tmp/raw_commits.txt | sed 's/^/- /' || true)
-          DOCS=$(grep  -E '^docs(\(|:|!| )'  /tmp/raw_commits.txt | sed 's/^/- /' || true)
-          CHO=$(grep   -E '^chore(\(|:|!| )' /tmp/raw_commits.txt | sed 's/^/- /' || true)
-          OTHER=$(grep -vE '^(feat|fix|docs|chore)(\(|:|!| )' /tmp/raw_commits.txt \
+          FEATS=$(grep -E '^feat(\(|:|!| )'  /tmp/raw.txt | sed 's/^/- /' || true)
+          FIXES=$(grep -E '^fix(\(|:|!| )'   /tmp/raw.txt | sed 's/^/- /' || true)
+          OTHER=$(grep -vE '^(feat|fix|docs|chore)(\(|:|!| )' /tmp/raw.txt \
                   | grep -v '^$' | sed 's/^/- /' || true)
 
           {
@@ -253,12 +415,6 @@ jobs:
             echo "fixes<<EOF"
             [[ -n "$FIXES" ]] && echo "$FIXES" || echo "- No fixes in this release"
             echo "EOF"
-            echo "docs<<EOF"
-            [[ -n "$DOCS" ]] && echo "$DOCS" || true
-            echo "EOF"
-            echo "chore<<EOF"
-            [[ -n "$CHO" ]] && echo "$CHO" || true
-            echo "EOF"
             echo "other<<EOF"
             [[ -n "$OTHER" ]] && echo "$OTHER" || true
             echo "EOF"
@@ -267,66 +423,59 @@ jobs:
       - name: Compose release body
         shell: bash
         env:
-          TAG:        ${{ needs.guard.outputs.version }}
-          SINCE:      ${{ steps.changelog.outputs.since_text }}
-          FEATS:      ${{ steps.changelog.outputs.feats }}
-          FIXES:      ${{ steps.changelog.outputs.fixes }}
-          DOCS:       ${{ steps.changelog.outputs.docs }}
-          CHORE:      ${{ steps.changelog.outputs.chore }}
-          OTHER:      ${{ steps.changelog.outputs.other }}
-          LINUX_SHA:  ${{ steps.sums.outputs.linux_sha }}
-          WIN_SHA:    ${{ steps.sums.outputs.win_sha }}
-          LINUX_SIZE: ${{ steps.sums.outputs.linux_size }}
-          WIN_SIZE:   ${{ steps.sums.outputs.win_size }}
-          LINUX_FILE: ${{ steps.sums.outputs.linux_file }}
-          WIN_FILE:   ${{ steps.sums.outputs.win_file }}
-          REPO:       ${{ github.repository }}
-          RUN_URL:    https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TAG:         ${{ needs.guard.outputs.version }}
+          SINCE:       ${{ steps.changelog.outputs.since_text }}
+          FEATS:       ${{ steps.changelog.outputs.feats }}
+          FIXES:       ${{ steps.changelog.outputs.fixes }}
+          OTHER:       ${{ steps.changelog.outputs.other }}
+          LINUX_BASE:  ${{ steps.sums.outputs.linux_base }}
+          LINUX_FULL:  ${{ steps.sums.outputs.linux_full }}
+          WIN_BASE:    ${{ steps.sums.outputs.win_base }}
+          WIN_FULL:    ${{ steps.sums.outputs.win_full }}
+          CARRIED_BASE: ${{ steps.carry.outputs.carried_base }}
+          CARRIED_FULL: ${{ steps.carry.outputs.carried_full }}
+          PREV_TAG:    ${{ steps.prev.outputs.tag }}
+          REPO:        ${{ github.repository }}
         run: |
-          cat > release_body.md <<EOF
+          set -e
+          SUMMARY=""
+          if [[ "$CARRIED_BASE" == "true" ]]; then
+            SUMMARY="${SUMMARY}* The **base** variant was carried over from \`${PREV_TAG}\` — its source branch had no new commits requiring a rebuild.\n"
+          fi
+          if [[ "$CARRIED_FULL" == "true" ]]; then
+            SUMMARY="${SUMMARY}* The **full** variant was carried over from \`${PREV_TAG}\` — its source branch had no new commits requiring a rebuild.\n"
+          fi
+
+          cat > body.md <<EOF
           # Skyroom Bot ${TAG}
 
-          Automated release built from \`${GITHUB_SHA::7}\` on $(date -u '+%Y-%m-%d at %H:%M UTC').
+          Automated release built from \`${GITHUB_SHA::7}\`.
 
-          Skyroom Bot is a desktop application that automatically joins your scheduled Skyroom classes at a random time within a configurable window, keeps a WebSocket watchdog running to recover from dropped connections, and can hibernate your machine between sessions and wake it up right before each class.
-
-          ---
+          Skyroom Bot is a desktop application that automatically joins your scheduled Skyroom classes, keeps a WebSocket watchdog running to recover from dropped connections, and can hibernate your machine between sessions and wake it before each class.
 
           ## Downloads
 
-          | Platform | File | Size | SHA-256 |
-          |---|---|---|---|
-          | **Windows** (x86-64) | [\`${WIN_FILE}\`](https://github.com/${REPO}/releases/download/${TAG}/${WIN_FILE}) | ${WIN_SIZE} | \`${WIN_SHA}\` |
-          | **Linux** (x86-64)   | [\`${LINUX_FILE}\`](https://github.com/${REPO}/releases/download/${TAG}/${LINUX_FILE}) | ${LINUX_SIZE} | \`${LINUX_SHA}\` |
+          **Base** — classic SkyroomBot, no Jarvis.
+          **Full** — includes the Jarvis live listener.
+
+          | Platform | Variant | File |
+          |---|---|---|
+          | Windows (x86-64) | base | \`${WIN_BASE}\` |
+          | Windows (x86-64) | full | \`${WIN_FULL}\` |
+          | Linux (x86-64)   | base | \`${LINUX_BASE}\` |
+          | Linux (x86-64)   | full | \`${LINUX_FULL}\` |
 
           A \`SHA256SUMS\` file is attached for scripted verification.
 
-          ---
+          ${SUMMARY}
 
           ## System requirements
 
-          - **Google Chrome** must be installed. The correct chromedriver is bundled inside each binary — you do **not** need to install Selenium, Python, or chromedriver yourself.
+          - **Google Chrome** must be installed. Chromedriver is bundled — you do **not** need Selenium, Python, or a driver installed separately.
           - **Windows:** Windows 10 or newer (x86-64).
-          - **Linux:** any modern x86-64 distribution with \`glibc\` 2.31 or newer (Ubuntu 20.04+, Fedora 32+, Debian 11+, or equivalent).
+          - **Linux:** any modern x86-64 distro with \`glibc\` 2.31+ (Ubuntu 20.04+, Fedora 32+, Debian 11+).
 
-          ---
-
-          ## Installation
-
-          **Windows**
-          1. Download \`${WIN_FILE}\`.
-          2. Move it to a folder of your choice.
-          3. Double-click to run.
-
-          **Linux**
-          1. Download \`${LINUX_FILE}\`.
-          2. \`chmod +x ${LINUX_FILE}\`
-          3. \`./${LINUX_FILE}\`
-
-          **Verify the download**
-          \`\`\`bash
-          sha256sum -c SHA256SUMS
-          \`\`\`
+          The **full** variant downloads the Whisper model (~3 GB) and, optionally, CUDA libraries on first live-mode use. Internet required once.
 
           ---
 
@@ -339,40 +488,33 @@ jobs:
           ${FIXES}
           EOF
 
-          if [[ -n "${DOCS}" ]]; then
-            { echo ""; echo "### Documentation"; echo "${DOCS}"; } >> release_body.md
-          fi
-          if [[ -n "${CHORE}" ]]; then
-            { echo ""; echo "### Maintenance"; echo "${CHORE}"; } >> release_body.md
-          fi
           if [[ -n "${OTHER}" ]]; then
-            { echo ""; echo "### Other changes"; echo "${OTHER}"; } >> release_body.md
+            { echo ""; echo "### Other changes"; echo "${OTHER}"; } >> body.md
           fi
 
-          cat >> release_body.md <<EOF
+          cat >> body.md <<EOF
 
           ---
 
           ## Notes
 
-          - This build targets the current stable Chrome for Testing release.
           - Configuration and window layout are persisted per user.
-          - Bug reports are welcome via Issues.
-          - Build log: ${RUN_URL}
+          - Bug reports welcome via Issues.
           EOF
+
+          cat body.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.guard.outputs.version }}
           name: Skyroom Bot ${{ needs.guard.outputs.version }}
-          body_path: release_body.md
+          body_path: body.md
           draft: false
           prerelease: false
           make_latest: true
           files: |
-            artifacts/build-windows/${{ steps.sums.outputs.win_file }}
-            artifacts/build-linux/${{ steps.sums.outputs.linux_file }}
-            artifacts/SHA256SUMS
+            release/SkyroomBot-*
+            release/SHA256SUMS
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
