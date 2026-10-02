@@ -26,11 +26,11 @@ jobs:
     name: Decide what to build
     runs-on: ubuntu-latest
     outputs:
-      should_run:   ${{ steps.decide.outputs.should_run }}
-      version:      ${{ steps.ver.outputs.version }}
-      version_nov:  ${{ steps.ver.outputs.version_nov }}
-      build_base:   ${{ steps.decide.outputs.build_base }}
-      build_full:   ${{ steps.decide.outputs.build_full }}
+      should_run:  ${{ steps.decide.outputs.should_run }}
+      version:     ${{ steps.ver.outputs.version }}
+      version_nov: ${{ steps.ver.outputs.version_nov }}
+      build_base:  ${{ steps.decide.outputs.build_base }}
+      build_full:  ${{ steps.decide.outputs.build_full }}
 
     steps:
       - name: Checkout
@@ -58,33 +58,22 @@ jobs:
             echo "Tag push: building both"
           else
             if echo "$MSG" | grep -q '\[skip ci\]'; then
-              BUILD_BASE="false"
-              BUILD_FULL="false"
+              BUILD_BASE="false"; BUILD_FULL="false"
               echo "Skipped due to [skip ci]"
             elif echo "$MSG" | grep -q '\[build\]'; then
-              BUILD_BASE="true"
-              BUILD_FULL="true"
+              BUILD_BASE="true"; BUILD_FULL="true"
               echo "Triggered by [build]: both variants"
             else
-              if echo "$MSG" | grep -q '\[build-base\]'; then
-                BUILD_BASE="true"
-              fi
-              if echo "$MSG" | grep -q '\[build-full\]'; then
-                BUILD_FULL="true"
-              fi
+              echo "$MSG" | grep -q '\[build-base\]' && BUILD_BASE="true"
+              echo "$MSG" | grep -q '\[build-full\]' && BUILD_FULL="true"
             fi
           fi
 
           if [[ "$BUILD_BASE" == "false" && "$BUILD_FULL" == "false" ]]; then
-            echo "should_run=false"
             echo "should_run=false" >> "$GITHUB_OUTPUT"
-            echo "build_base=false" >> "$GITHUB_OUTPUT"
-            echo "build_full=false" >> "$GITHUB_OUTPUT"
-            exit 0
+          else
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
           fi
-
-          echo "should_run=true"
-          echo "should_run=true" >> "$GITHUB_OUTPUT"
           echo "build_base=$BUILD_BASE" >> "$GITHUB_OUTPUT"
           echo "build_full=$BUILD_FULL" >> "$GITHUB_OUTPUT"
 
@@ -99,8 +88,8 @@ jobs:
             BASE=$(cat VERSION | tr -d '[:space:]')
             TAG="v${BASE}.${GITHUB_RUN_NUMBER}"
           fi
-          echo "version=$TAG"           >> "$GITHUB_OUTPUT"
-          echo "version_nov=${TAG#v}"   >> "$GITHUB_OUTPUT"
+          echo "version=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "version_nov=${TAG#v}" >> "$GITHUB_OUTPUT"
           echo "Resolved version: $TAG"
 
   # =========================================================
@@ -200,7 +189,7 @@ jobs:
           BUILD_VARIANT: ${{ matrix.variant }}
         run: python -m PyInstaller --clean --noconfirm skyroom_bot.spec
 
-      - name: Rename output
+      - name: Rename and package output
         if: steps.gate.outputs.enabled == 'true'
         shell: bash
         run: |
@@ -209,19 +198,34 @@ jobs:
           PLATFORM="${{ matrix.platform }}"
           VARIANT="${{ matrix.variant }}"
           EXT="${{ matrix.ext }}"
-          FINAL="SkyroomBot-${VERSION}-${PLATFORM}-x64-${VARIANT}${EXT}"
-          cd dist
-          mv "SkyroomBot${EXT}" "$FINAL"
+
+          if [[ "$VARIANT" == "full" ]]; then
+            # onedir — folder must be archived
+            cd dist
+            if [[ "$PLATFORM" == "windows" ]]; then
+              FINAL="SkyroomBot-${VERSION}-${PLATFORM}-x64-${VARIANT}.zip"
+              7z a -tzip "$FINAL" SkyroomBot/
+            else
+              FINAL="SkyroomBot-${VERSION}-${PLATFORM}-x64-${VARIANT}.tar.gz"
+              tar -czf "$FINAL" SkyroomBot/
+            fi
+          else
+            # onefile — single binary
+            FINAL="SkyroomBot-${VERSION}-${PLATFORM}-x64-${VARIANT}${EXT}"
+            cd dist
+            mv "SkyroomBot${EXT}" "$FINAL"
+          fi
           echo "Final name: $FINAL"
           ls -la
 
-      - name: Make Linux binary executable
+      - name: Make Linux base binary executable
         if: |
           steps.gate.outputs.enabled == 'true' &&
-          matrix.os == 'ubuntu-latest'
+          matrix.os == 'ubuntu-latest' &&
+          matrix.variant == 'base'
         shell: bash
         run: |
-          chmod +x "dist/SkyroomBot-${{ needs.guard.outputs.version }}-linux-x64-${{ matrix.variant }}"
+          chmod +x "dist/SkyroomBot-${{ needs.guard.outputs.version }}-linux-x64-base"
 
       - name: Smoke test (Linux)
         if: |
@@ -230,7 +234,13 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          BIN="dist/SkyroomBot-${{ needs.guard.outputs.version }}-linux-x64-${{ matrix.variant }}"
+          if [[ "${{ matrix.variant }}" == "full" ]]; then
+            ARCHIVE="dist/SkyroomBot-${{ needs.guard.outputs.version }}-linux-x64-full.tar.gz"
+            mkdir -p /tmp/smoke && tar -xzf "$ARCHIVE" -C /tmp/smoke
+            BIN="/tmp/smoke/SkyroomBot/SkyroomBot"
+          else
+            BIN="dist/SkyroomBot-${{ needs.guard.outputs.version }}-linux-x64-base"
+          fi
           test -f "$BIN" && echo "binary exists"
           timeout 10 "$BIN" || true
 
@@ -240,16 +250,26 @@ jobs:
           matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          $bin = "dist/SkyroomBot-${{ needs.guard.outputs.version }}-windows-x64-${{ matrix.variant }}.exe"
-          if (-not (Test-Path $bin)) { throw "binary not built: $bin" }
-          Write-Host "binary exists"
+          if ("${{ matrix.variant }}" -eq "full") {
+            $archive = "dist/SkyroomBot-${{ needs.guard.outputs.version }}-windows-x64-full.zip"
+            if (-not (Test-Path $archive)) { throw "archive missing: $archive" }
+            Write-Host "archive exists: $archive"
+          } else {
+            $bin = "dist/SkyroomBot-${{ needs.guard.outputs.version }}-windows-x64-base.exe"
+            if (-not (Test-Path $bin)) { throw "binary not built: $bin" }
+            Write-Host "binary exists: $bin"
+          }
 
-      - name: Upload binary
+      - name: Upload artifact
         if: steps.gate.outputs.enabled == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: build-${{ matrix.platform }}-${{ matrix.variant }}
-          path: dist/SkyroomBot-*-${{ matrix.platform }}-x64-${{ matrix.variant }}${{ matrix.ext }}
+          path: |
+            dist/SkyroomBot-*.tar.gz
+            dist/SkyroomBot-*.zip
+            dist/SkyroomBot-*-base
+            dist/SkyroomBot-*-base.exe
           if-no-files-found: error
 
   # =========================================================
@@ -283,21 +303,16 @@ jobs:
           set -e
           PREV=$(gh release list --limit 1 --json tagName \
                  --jq '.[0].tagName // empty' 2>/dev/null || echo "")
-          if [[ -z "$PREV" ]]; then
-            echo "No previous release found."
-            PREV=""
-          else
-            echo "Previous release: $PREV"
-          fi
+          echo "Previous: ${PREV:-none}"
           echo "tag=$PREV" >> "$GITHUB_OUTPUT"
 
       - name: Carry over non-built variants
         id: carry
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION:  ${{ needs.guard.outputs.version }}
-          PREV_TAG: ${{ steps.prev.outputs.tag }}
+          GH_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
+          VERSION:    ${{ needs.guard.outputs.version }}
+          PREV_TAG:   ${{ steps.prev.outputs.tag }}
           BUILD_BASE: ${{ needs.guard.outputs.build_base }}
           BUILD_FULL: ${{ needs.guard.outputs.build_full }}
         run: |
@@ -306,9 +321,6 @@ jobs:
           CARRIED_FULL="false"
 
           if [[ -z "$PREV_TAG" ]]; then
-            # First release ever: nothing to carry. If we were asked to
-            # not build a variant, that variant is simply missing from
-            # this first release.
             echo "First release; nothing to carry."
             echo "carried_base=false" >> "$GITHUB_OUTPUT"
             echo "carried_full=false" >> "$GITHUB_OUTPUT"
@@ -329,23 +341,22 @@ jobs:
           if [[ "$BUILD_FULL" == "false" ]]; then
             echo "Carrying full from $PREV_TAG"
             gh release download "$PREV_TAG" \
-              -p "SkyroomBot-*-linux-x64-full" \
-              -p "SkyroomBot-*-windows-x64-full.exe" \
+              -p "SkyroomBot-*-linux-x64-full.tar.gz" \
+              -p "SkyroomBot-*-windows-x64-full.zip" \
               -D artifacts/carried 2>/dev/null || true
             CARRIED_FULL="true"
           fi
 
           # Rename carried files to the new version so the release is
           # internally consistent.
-          if [[ -d artifacts/carried ]]; then
-            for f in artifacts/carried/SkyroomBot-*; do
-              [[ -e "$f" ]] || continue
-              base=$(basename "$f")
-              newname=$(echo "$base" | sed -E "s/SkyroomBot-[^-]+-(linux|windows)/SkyroomBot-${VERSION}-\1/")
-              mv "$f" "artifacts/carried/$newname"
-              echo "Renamed: $base -> $newname"
-            done
-          fi
+          for f in artifacts/carried/SkyroomBot-*; do
+            [[ -e "$f" ]] || continue
+            base=$(basename "$f")
+            newname=$(echo "$base" | sed -E \
+              "s/SkyroomBot-[^-]+-(linux|windows)/SkyroomBot-${VERSION}-\1/")
+            mv "$f" "artifacts/carried/$newname"
+            echo "Renamed: $base -> $newname"
+          done
 
           echo "carried_base=$CARRIED_BASE" >> "$GITHUB_OUTPUT"
           echo "carried_full=$CARRIED_FULL" >> "$GITHUB_OUTPUT"
@@ -355,14 +366,15 @@ jobs:
         run: |
           set -e
           mkdir -p release
-          # Fresh builds live under artifacts/build-*; carried lives
-          # under artifacts/carried
           find artifacts -type f \( \
-              -name 'SkyroomBot-*' -o -name 'SkyroomBot-*.exe' \) \
+              -name 'SkyroomBot-*.tar.gz' -o \
+              -name 'SkyroomBot-*.zip' -o \
+              -name 'SkyroomBot-*-base' -o \
+              -name 'SkyroomBot-*-base.exe' \) \
             -exec cp -v {} release/ \;
           ls -la release/
 
-      - name: Generate checksums
+      - name: Generate checksums and detect files
         id: sums
         shell: bash
         run: |
@@ -371,11 +383,10 @@ jobs:
           sha256sum SkyroomBot-* > SHA256SUMS
           cat SHA256SUMS
 
-          # Expose file names for the release body
           LINUX_BASE=$(ls SkyroomBot-*-linux-x64-base 2>/dev/null || echo "")
-          LINUX_FULL=$(ls SkyroomBot-*-linux-x64-full 2>/dev/null || echo "")
+          LINUX_FULL=$(ls SkyroomBot-*-linux-x64-full.tar.gz 2>/dev/null || echo "")
           WIN_BASE=$(ls SkyroomBot-*-windows-x64-base.exe 2>/dev/null || echo "")
-          WIN_FULL=$(ls SkyroomBot-*-windows-x64-full.exe 2>/dev/null || echo "")
+          WIN_FULL=$(ls SkyroomBot-*-windows-x64-full.zip 2>/dev/null || echo "")
 
           {
             echo "linux_base=$LINUX_BASE"
@@ -393,11 +404,9 @@ jobs:
           PREV="${{ steps.prev.outputs.tag }}"
 
           if [[ -z "$PREV" ]]; then
-            RANGE="HEAD"
-            SINCE_TEXT="Initial public release"
+            RANGE="HEAD"; SINCE_TEXT="Initial public release"
           else
-            RANGE="${PREV}..HEAD"
-            SINCE_TEXT="Changes since ${PREV}"
+            RANGE="${PREV}..HEAD"; SINCE_TEXT="Changes since ${PREV}"
           fi
 
           git log --pretty=format:'%s' "$RANGE" > /tmp/raw.txt || true
@@ -423,19 +432,19 @@ jobs:
       - name: Compose release body
         shell: bash
         env:
-          TAG:         ${{ needs.guard.outputs.version }}
-          SINCE:       ${{ steps.changelog.outputs.since_text }}
-          FEATS:       ${{ steps.changelog.outputs.feats }}
-          FIXES:       ${{ steps.changelog.outputs.fixes }}
-          OTHER:       ${{ steps.changelog.outputs.other }}
-          LINUX_BASE:  ${{ steps.sums.outputs.linux_base }}
-          LINUX_FULL:  ${{ steps.sums.outputs.linux_full }}
-          WIN_BASE:    ${{ steps.sums.outputs.win_base }}
-          WIN_FULL:    ${{ steps.sums.outputs.win_full }}
+          TAG:          ${{ needs.guard.outputs.version }}
+          SINCE:        ${{ steps.changelog.outputs.since_text }}
+          FEATS:        ${{ steps.changelog.outputs.feats }}
+          FIXES:        ${{ steps.changelog.outputs.fixes }}
+          OTHER:        ${{ steps.changelog.outputs.other }}
+          LINUX_BASE:   ${{ steps.sums.outputs.linux_base }}
+          LINUX_FULL:   ${{ steps.sums.outputs.linux_full }}
+          WIN_BASE:     ${{ steps.sums.outputs.win_base }}
+          WIN_FULL:     ${{ steps.sums.outputs.win_full }}
           CARRIED_BASE: ${{ steps.carry.outputs.carried_base }}
           CARRIED_FULL: ${{ steps.carry.outputs.carried_full }}
-          PREV_TAG:    ${{ steps.prev.outputs.tag }}
-          REPO:        ${{ github.repository }}
+          PREV_TAG:     ${{ steps.prev.outputs.tag }}
+          REPO:         ${{ github.repository }}
         run: |
           set -e
           SUMMARY=""
@@ -453,10 +462,12 @@ jobs:
 
           Skyroom Bot is a desktop application that automatically joins your scheduled Skyroom classes, keeps a WebSocket watchdog running to recover from dropped connections, and can hibernate your machine between sessions and wake it before each class.
 
-          ## Downloads
+          ## Which variant do I want?
 
-          **Base** — classic SkyroomBot, no Jarvis.
-          **Full** — includes the Jarvis live listener.
+          - **Base** — classic SkyroomBot. Joins classes, watches the connection, sleeps and wakes. No live listener. ~50 MB, single file.
+          - **Full** — everything in base, plus the Jarvis live listener: transcribes the class audio, extracts instructions, and queues actions for your approval. Distributed as an archive because the runtime is larger.
+
+          ## Downloads
 
           | Platform | Variant | File |
           |---|---|---|
@@ -468,14 +479,28 @@ jobs:
           A \`SHA256SUMS\` file is attached for scripted verification.
 
           ${SUMMARY}
-
           ## System requirements
 
           - **Google Chrome** must be installed. Chromedriver is bundled — you do **not** need Selenium, Python, or a driver installed separately.
           - **Windows:** Windows 10 or newer (x86-64).
           - **Linux:** any modern x86-64 distro with \`glibc\` 2.31+ (Ubuntu 20.04+, Fedora 32+, Debian 11+).
 
-          The **full** variant downloads the Whisper model (~3 GB) and, optionally, CUDA libraries on first live-mode use. Internet required once.
+          The **full** variant downloads the Whisper model (~3 GB) on first live-mode use and, optionally, CUDA libraries (~1 GB) if an NVIDIA GPU is present. Internet required once.
+
+          ## Installation
+
+          **Windows**
+          - **base:** download the \`.exe\` and double-click.
+          - **full:** download the \`.zip\`, extract it, and run \`SkyroomBot\\SkyroomBot.exe\`.
+
+          **Linux**
+          - **base:** \`chmod +x SkyroomBot-*-linux-x64-base\` then run it.
+          - **full:** \`tar -xzf SkyroomBot-*-linux-x64-full.tar.gz\` then run \`SkyroomBot/SkyroomBot\`.
+
+          Verify downloads with:
+          \`\`\`bash
+          sha256sum -c SHA256SUMS
+          \`\`\`
 
           ---
 
