@@ -8,3 +8,4 @@ drivers/
 dist/
 build/
 info.md
+structure.json

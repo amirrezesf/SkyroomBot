@@ -151,9 +151,20 @@ def next_occurrence_range(day_name: str,
 
     candidate_end = _end_for(candidate_start)
 
+    # ---- Case 0: a class that started YESTERDAY evening and is still
+    # running now. It belongs to the previous weekday's occurrence, which
+    # `candidate_start` (built from today's weekday) never looks at, so
+    # without this a 23:00-01:00 class is invisible from 00:00 to 01:00.
+    prev_start = candidate_start - timedelta(days=7)
+    prev_end = _end_for(prev_start)
+    if prev_start <= now < prev_end:
+        return prev_start, prev_end
+
     # ---- Case 1: we are inside today's class right now ----
-    if (now.weekday() == target_wd
-            and candidate_start <= now < candidate_end):
+    # No weekday test here: a class that ends after midnight lives on the
+    # *next* weekday for its second half, so "now.weekday() == target_wd"
+    # would fail at 00:30 for a 23:00-01:00 class and send us a week ahead.
+    if candidate_start <= now < candidate_end:
         return candidate_start, candidate_end
 
     # ---- Case 2: class starts in the future (today or later) ----
@@ -215,14 +226,24 @@ WS_MONITOR_JS = r"""
         const ws = (protocols === undefined)
             ? new OriginalWS(url)
             : new OriginalWS(url, protocols);
+        // Only count sockets that actually reached 'open'.  A socket that
+        // fails before opening fires 'error'/'close' without ever firing
+        // 'open', and counting those pushed __wsActive negative, which made
+        // the watchdog report a dead connection while the page was still
+        // retrying — triggering a needless full re-login.
+        let counted = false;
         ws.addEventListener('open',  function () {
+            counted = true;
             window.__wsActive++; window.__wsOpened++;
         });
         ws.addEventListener('close', function () {
-            window.__wsActive--; window.__wsLastClose = Date.now();
+            if (!counted) { return; }
+            counted = false;
+            window.__wsActive--;
+            window.__wsLastClose = Date.now();
         });
         ws.addEventListener('error', function () {
-            window.__wsLastClose = Date.now();
+            if (counted) { window.__wsLastClose = Date.now(); }
         });
         return ws;
     }
@@ -320,6 +341,12 @@ class SkyroomBot:
         self.threads: List[threading.Thread] = []
         self.active_drivers: set = set()
         self._drivers_lock = threading.Lock()
+        # Driver discovery happens once per run and is shared by every task
+        # thread (see _resolve_driver).
+        self._driver_lock = threading.Lock()
+        self._driver_ready = threading.Event()
+        self._driver_path: Optional[str] = None
+        self._sm_lock = threading.Lock()
 
     # ----- public API -----
     def start(self) -> List[Task]:
@@ -374,6 +401,9 @@ class SkyroomBot:
                                 f"({end_dt:%H:%M} Tehran)")
 
                 # Classify so the user can see exactly what was decided.
+                # "already ended" is unreachable: next_occurrence_range()
+                # never returns a past range — it rolls forward a week
+                # instead. Kept only as a guard against a clock change.
                 if now >= end_dt:
                     status = "already ended — will skip"
                 elif start_dt <= now < end_dt:
@@ -406,6 +436,8 @@ class SkyroomBot:
         tag = f"[{task.user_name}@{task.class_name}]"
 
         # ---- 1) end-of-class guard ----
+        # next_occurrence_range() never hands us an ended class, so this only
+        # triggers if the wall clock jumped forward after the task was built.
         now = datetime.now(TEHRAN_TZ)
         if now >= task.end_time:
             self._log("INFO",
@@ -486,6 +518,38 @@ class SkyroomBot:
         self._log("ERROR", f"{tag} giving up after {self.cfg.max_restarts} attempts")
 
     # ----- driver + clicks -----
+    @staticmethod
+    def _chrome_launch_env() -> dict:
+        # PyInstaller onefile exports its bundled libs via LD_LIBRARY_PATH
+        # pointing at the _MEI temp dir. Chrome honors that and picks up
+        # the bundle's older libnss3.so instead of the system one, then
+        # dies with "libnss3.so: version `NSS_x' not found". Strip any
+        # bundle dir from the library search path so Chrome uses system NSS.
+        env = os.environ.copy()
+        bundle_dir = getattr(sys, "_MEIPASS", None)
+
+        def _clean(var: str) -> None:
+            val = env.get(var)
+            if not val:
+                return
+            kept = []
+            for part in val.split(os.pathsep):
+                if not part:
+                    continue
+                if bundle_dir and part == bundle_dir:
+                    continue
+                if "_MEI" in part:
+                    continue
+                kept.append(part)
+            if kept:
+                env[var] = os.pathsep.join(kept)
+            else:
+                env.pop(var, None)
+
+        _clean("LD_LIBRARY_PATH")
+        _clean("LD_PRELOAD")
+        return env
+
     def get_chromedriver_path(self):
         if getattr(sys, 'frozen', False):
             base = Path(sys._MEIPASS)
@@ -500,12 +564,33 @@ class SkyroomBot:
             return str(local)
         return None    # fall back to Selenium Manager
 
-    def _build_driver(self) -> webdriver.Chrome:
-        # Fully automatic driver resolution: bundled driver -> PATH ->
-        # Selenium Manager (auto-download). The user never sets a path:
-        # release binaries ship one under drivers/, dev machines usually
-        # have one on PATH, and Selenium Manager covers the rest.
-        candidates: list[str] = []
+    # ----- driver discovery (once per run, shared by every task) -----
+    @staticmethod
+    def _chrome_binary() -> Optional[str]:
+        """Locate the installed Chrome/Chromium, or None if it is missing."""
+        for name in ("google-chrome", "google-chrome-stable", "chromium",
+                     "chromium-browser", "chrome"):
+            hit = shutil.which(name)
+            if hit:
+                return hit
+        if sys.platform == "win32":
+            for env in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+                base = os.environ.get(env)
+                if not base:
+                    continue
+                cand = Path(base) / "Google/Chrome/Application/chrome.exe"
+                if cand.exists():
+                    return str(cand)
+        elif sys.platform == "darwin":
+            cand = (Path("/Applications/Google Chrome.app/Contents/MacOS")
+                    / "Google Chrome")
+            if cand.exists():
+                return str(cand)
+        return None
+
+    def _probe_driver_candidates(self) -> Optional[str]:
+        """Return the first chromedriver binary that actually runs here."""
+        candidates: List[str] = []
         bundled = self.get_chromedriver_path()
         if bundled:
             candidates.append(bundled)
@@ -513,6 +598,85 @@ class SkyroomBot:
         if path_hit and path_hit not in candidates:
             candidates.append(path_hit)
 
+        for path in candidates:
+            if not os.path.isfile(path):
+                continue
+            try:
+                proc = subprocess.run(
+                    [path, "--version"], capture_output=True, text=True,
+                    timeout=15,
+                )
+            except Exception as e:
+                self._log("WARNING",
+                          f"chromedriver not runnable ({path}): {e} — skipping")
+                continue
+            if proc.returncode != 0:
+                err = (proc.stderr or proc.stdout or "").strip()
+                self._log("WARNING",
+                          f"chromedriver --version failed ({path}): {err} — "
+                          "skipping")
+                continue
+            self._log("INFO", f"{path}: {(proc.stdout or '').strip()}")
+            return path
+        return None
+
+    def _resolve_driver(self) -> Optional[str]:
+        """
+        Decide once per bot run which chromedriver to use (None = let
+        Selenium Manager handle it).
+
+        Every task thread used to repeat this on every retry, so N classes
+        over R restarts meant N×R `chromedriver --version` subprocesses, and
+        several threads could enter Selenium Manager simultaneously and race
+        each other's download into the shared cache.
+        """
+        if self._driver_ready.is_set():
+            return self._driver_path
+        with self._driver_lock:
+            if self._driver_ready.is_set():
+                return self._driver_path
+            try:
+                self._driver_path = self._probe_driver_candidates()
+            finally:
+                self._driver_ready.set()
+        return self._driver_path
+
+    def preflight(self) -> List[str]:
+        """
+        Cheap environment checks the user can act on, in plain language.
+        An empty list means the machine looks ready.  Runs before the first
+        browser is opened so problems surface as one readable message
+        instead of a wall of Selenium errors.
+        """
+        problems: List[str] = []
+
+        if not self._chrome_binary():
+            problems.append(
+                "Google Chrome is not installed or cannot be found on this "
+                "system. Install it, then press Start again."
+            )
+
+        if self._resolve_driver() is None:
+            problems.append(
+                "No working chromedriver was found next to the app. The bot "
+                "will try to download a matching one automatically — this "
+                "needs an internet connection and only happens on the first "
+                "run."
+            )
+
+        try:
+            if hasattr(os, "geteuid") and os.geteuid() == 0 \
+                    and sys.platform != "win32":
+                problems.append(
+                    "You are running as root. Chrome will be started without "
+                    "its sandbox; a normal user account is recommended."
+                )
+        except Exception:
+            pass
+
+        return problems
+
+    def _chrome_options(self) -> Options:
         opts = Options()
         opts.add_argument("--incognito")
         opts.add_argument("--start-maximized")
@@ -541,84 +705,82 @@ class SkyroomBot:
                       "running as root — added --no-sandbox so Chrome can start")
         if sys.platform.startswith("linux") and os.environ.get("WAYLAND_DISPLAY"):
             opts.add_argument("--ozone-platform-hint=x11")
+        return opts
 
-        # Pre-flight: if a candidate driver cannot even report its version
-        # (stale binary, wrong arch, missing libs), skip it instead of
-        # letting Chrome exit obscurely later.
-        usable: list[str] = []
-        for path in candidates:
-            if not os.path.isfile(path):
-                continue
-            try:
-                proc = subprocess.run(
-                    [path, "--version"], capture_output=True, text=True,
-                    timeout=15,
-                )
-            except Exception as e:
-                self._log("WARNING",
-                          f"chromedriver not runnable ({path}): {e} — skipping")
-                continue
-            if proc.returncode != 0:
-                err = (proc.stderr or proc.stdout or "").strip()
-                self._log("WARNING",
-                          f"chromedriver --version failed ({path}): {err} — "
-                          "skipping")
-                continue
-            self._log("INFO", f"{path}: {(proc.stdout or '').strip()}")
-            usable.append(path)
+    def _build_driver(self) -> webdriver.Chrome:
+        """
+        Open one fresh incognito session.
 
+        The driver *binary* was already resolved once in _resolve_driver;
+        only the launch itself is repeated per attempt.  Selenium Manager is
+        serialized so two classes starting at the same time cannot race each
+        other's download.
+        """
+        opts = self._chrome_options()
+        chrome_env = self._chrome_launch_env()
+
+        path = self._resolve_driver()
         last_err: Optional[Exception] = None
-        version_mismatch_hits = 0
-        for path in usable:
+        version_mismatch = False
+
+        if path:
             try:
-                service = Service(executable_path=path)
-                driver = webdriver.Chrome(service=service, options=opts)
+                driver = webdriver.Chrome(
+                    service=Service(executable_path=path, env=chrome_env),
+                    options=opts)
                 self._log("INFO", f"using chromedriver: {path}")
-                break
+                return self._finish_driver(driver)
             except WebDriverException as e:
                 last_err = e
                 msg = str(e)
                 if "session not created" in msg and (
                         "This version of ChromeDriver only supports" in msg
                         or "Current browser version is" in msg):
-                    version_mismatch_hits += 1
+                    version_mismatch = True
                     self._log("WARNING",
                               f"version mismatch, driver ignored ({path}): "
                               f"{msg.splitlines()[0] if msg else e}")
-                    continue  # stale pinned driver: prefer Selenium Manager
-                self._log("WARNING",
-                          f"bundled/manual driver failed ({path}): {e} — "
-                          "trying next option")
-                continue
-        else:
-            driver = None
+                else:
+                    self._log("WARNING",
+                              f"bundled/manual driver failed ({path}): {e} — "
+                              "falling back to Selenium Manager")
+                # Don't let the rest of the run keep retrying a driver we
+                # already know is wrong.
+                with self._driver_lock:
+                    if self._driver_path == path:
+                        self._driver_path = None
 
-        if driver is None:
-            # No usable pinned driver: fall back to Selenium Manager, which
-            # resolves/downloads a matching driver (needs internet, first run
-            # only). Skip it though when the pinned drivers failed with a
-            # plain "Chrome instance exited" — that means Chrome itself (not
-            # the driver) cannot start, and SM would hit the same wall while
-            # hiding the verbose cause.
-            if last_err and version_mismatch_hits == 0 and (
-                    "session not created" in str(last_err)
-                    and "Chrome instance exited" in str(last_err)):
-                service_log = self._capture_service_log(opts, usable)
-                raise WebDriverException(
-                    "Could not start Chrome: Chrome itself exited "
-                    "immediately (not a driver-version problem). "
-                    f"Driver error was: {last_err}. {service_log}"
-                    "Check: google-chrome is installed and runnable "
-                    "(try `google-chrome --headless --dump-dom about:blank`), "
-                    "no stale /dev/shm or */.config/google-chrome lock, "
-                    "and enough disk/RAM."
-                )
-            self._log("INFO",
-                      "no usable bundled chromedriver — Selenium Manager "
-                      "will download the matching version "
-                      "(needs internet, first run only)…")
+        # ---- Selenium Manager (auto-resolve / auto-download) ----
+        # Skip it when the pinned driver failed with a plain "Chrome instance
+        # exited": that means Chrome itself cannot start, and SM would hit
+        # the same wall while hiding the real cause.
+        if last_err and not version_mismatch and (
+                "session not created" in str(last_err)
+                and "Chrome instance exited" in str(last_err)):
+            service_log = self._capture_service_log(
+                opts, [path] if path else [])
+            # The verbose log is diagnostic noise for a dialog: it belongs in
+            # the log tab, not in a message a user has to read.
+            self._log("ERROR", f"chromedriver diagnostic: {service_log}")
+            raise WebDriverException(
+                "Could not start Chrome: Chrome itself exited "
+                "immediately (not a driver-version problem). "
+                f"Driver error was: {last_err}. "
+                "Check: google-chrome is installed and runnable "
+                "(try `google-chrome --headless --dump-dom about:blank`), "
+                "no stale /dev/shm or */.config/google-chrome lock, "
+                "and enough disk/RAM. "
+                "The chromedriver log is in the report tab."
+            )
+
+        self._log("INFO",
+                  "no usable bundled chromedriver — Selenium Manager "
+                  "will download the matching version "
+                  "(needs internet, first run only)…")
+        with self._sm_lock:
             try:
-                driver = webdriver.Chrome(options=opts)
+                driver = webdriver.Chrome(options=opts,
+                                          service=Service(env=chrome_env))
                 self._log("INFO", "Selenium Manager provided a driver")
             except WebDriverException as e:
                 hint = (f" (tried bundled/manual drivers too: {last_err})"
@@ -628,8 +790,10 @@ class SkyroomBot:
                     f"Selenium Manager failed: {e}{hint}. "
                     "Make sure Google Chrome is installed."
                 )
-        driver.set_page_load_timeout(self.cfg.page_load_timeout)
+        return self._finish_driver(driver)
 
+    def _finish_driver(self, driver) -> webdriver.Chrome:
+        driver.set_page_load_timeout(self.cfg.page_load_timeout)
         driver.execute_cdp_cmd(
             "Page.addScriptToEvaluateOnNewDocument",
             {"source": WS_MONITOR_JS},
@@ -774,6 +938,7 @@ class SkyroomBot:
                       f"{tag} staying in room until {task.end_time:%H:%M} Tehran")
 
             stream_started = False
+            checks_without_stream = 0
             while True:
                 if datetime.now(TEHRAN_TZ) >= task.end_time:
                     self._log("INFO", f"{tag} end time reached — closing session")
@@ -797,6 +962,19 @@ class SkyroomBot:
                         self._log("INFO",
                                   f"{tag} stream detected "
                                   f"({opened} socket(s)) — monitoring")
+                    else:
+                        # Don't spin silently until end_time if the class
+                        # page never actually opened — say so once, then
+                        # again later, so a failed login is visible.
+                        checks_without_stream += 1
+                        waited = (checks_without_stream
+                                  * self.cfg.ws_check_interval)
+                        if checks_without_stream in (6, 24):
+                            self._log(
+                                "WARNING",
+                                f"{tag} no class media socket after "
+                                f"{waited // 60} min — login may have "
+                                f"failed; check the browser window")
                     continue
 
                 if self._ws_is_dead(driver):
