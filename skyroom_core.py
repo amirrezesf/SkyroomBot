@@ -7,6 +7,7 @@ Each class has a start time and an end time on the same Persian weekday.
 
 import os
 from pathlib import Path
+import queue
 import random
 import shutil
 import subprocess
@@ -270,7 +271,9 @@ class Task:
     message_sent: bool = field(default=False, init=False)
     user_dict: dict = field(default_factory=dict)   
     live: bool = False                              
-    
+    work_queue: "queue.Queue[tuple[str, dict]] | None" = field(
+        default=None, init=False,
+    )
 
     def compute_actual(self, cfg: RuntimeConfig) -> None:
         """
@@ -908,7 +911,10 @@ class SkyroomBot:
             self._log("INFO", f"{tag} nickname confirmed")
             jarvis_active = False
             if task.live:
-                jarvis_active = self.jarvis.acquire(tag, task.user_dict)
+                task.work_queue = queue.Queue()
+                jarvis_active = self.jarvis.acquire(
+                    tag, task.user_dict, task.work_queue,
+                )
             # STEP 3 - chat message (optional)
             if not self.cfg.send_message:
                 if not getattr(task, "_skip_msg_logged", False):
@@ -961,9 +967,11 @@ class SkyroomBot:
                     if self.stop_event.wait(interval):
                         return "STOPPED"
 
+                    if jarvis_active and task.work_queue is not None:
+                        self._drain_action_queue(driver, task.work_queue, tag)
+
                     if self.cfg.debug_disable_ws_check:
                         continue
-
                     if not stream_started:
                         try:
                             opened = driver.execute_script(
@@ -1014,7 +1022,49 @@ class SkyroomBot:
             except Exception:
                 pass
             self._log("INFO", f"{tag} browser closed")
+    def _drain_action_queue(
+        self, driver, work_queue: "queue.Queue[tuple[str, dict]]", tag: str,
+    ) -> None:
+        """Execute any driver actions queued by the Jarvis backend."""
+        while True:
+            try:
+                action, args = work_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                if action == "type_number":
+                    self._send_chat(driver, str(args.get("n", "")))
+                    self._log("INFO",
+                              f"{tag} [jarvis] typed: {args.get('n')}")
+                elif action == "send_chat":
+                    self._send_chat(driver, str(args.get("text", "")))
+                    self._log("INFO",
+                              f"{tag} [jarvis] sent: {args.get('text')}")
+                else:
+                    self._log("WARNING",
+                              f"{tag} [jarvis] unknown action {action!r}")
+            except Exception as e:
+                self._log("ERROR",
+                          f"{tag} [jarvis] {action} failed: {e}")
 
+    def _send_chat(self, driver, text: str) -> None:
+        """Type text into the Skyroom chat box and press Enter."""
+        wait = WebDriverWait(driver, self.cfg.element_timeout)
+        chat_input = wait.until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, "#txt_input"))
+        )
+        # Clear any leftover text — handles both input.value and contenteditable.
+        try:
+            driver.execute_script(
+                "var el = document.querySelector('#txt_input'); "
+                "if (el) { if ('value' in el) el.value = ''; "
+                "el.textContent = ''; }"
+            )
+        except WebDriverException:
+            pass
+        chat_input.click()
+        chat_input.send_keys(text)
+        chat_input.send_keys(Keys.ENTER)
     def _ws_is_dead(self, driver) -> bool:
         if self.cfg.debug_disable_ws_check:
             return False
