@@ -46,6 +46,7 @@ except ImportError as e:
     print(f"(import error: {e})")
     sys.exit(1)
 
+from jarvis_integration import JARVIS_AVAILABLE, JarvisRuntime
 from skyroom_core import (
     RuntimeConfig,
     SkyroomBot,
@@ -706,7 +707,12 @@ class ClassDialog(QDialog):
         }
         self.accept()
 
-
+class JarvisBridge(QObject):
+    status = pyqtSignal(str)
+    transcript = pyqtSignal(str, float)
+    decision = pyqtSignal(object)
+    pending_added = pyqtSignal(int, str)
+    pending_removed = pyqtSignal(int)
 # ============================================================
 # Main window
 # ============================================================
@@ -732,6 +738,25 @@ class SkyroomGUI(QMainWindow):
         self.bridge.log.connect(self._append_log)
         self.bridge.finished.connect(self._on_bot_finished)
         self.bridge.arm_result.connect(self._on_arm_result)
+
+        self.jarvis_bridge = JarvisBridge()
+        self.jarvis = JarvisRuntime(self._emit_log)
+        self.jarvis.on_status = (
+            lambda s: self.jarvis_bridge.status.emit(s)
+        )
+        self.jarvis.on_transcript = (
+            lambda t, s: self.jarvis_bridge.transcript.emit(t, s)
+        )
+        self.jarvis.on_decision = (
+            lambda d: self.jarvis_bridge.decision.emit(d)
+        )
+        self.jarvis.on_pending_added = (
+            lambda i, s: self.jarvis_bridge.pending_added.emit(i, s)
+        )
+        self.jarvis.on_pending_removed = (
+            lambda i: self.jarvis_bridge.pending_removed.emit(i)
+        )
+        self._jarvis_pending_ids: list[int] = []
 
         self.cfg = self._load_config_from_settings()
 
@@ -1019,6 +1044,7 @@ class SkyroomGUI(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_general_tab(), "عمومی")
         self.tabs.addTab(self._build_wake_tab(), "خواب و بیدارباش")
+        self.tabs.addTab(self._build_jarvis_tab(), "Jarvis (دستیار صوتی)")   # <-- new
         self.tabs.addTab(self._build_debug_tab(), "اشکال‌زدایی")
         self.tabs.addTab(self._build_log_tab(), "گزارش")
         v.addWidget(self.tabs)
@@ -1169,7 +1195,111 @@ class SkyroomGUI(QMainWindow):
 
         scroll.setWidget(w)
         return scroll
+    
+    def _build_jarvis_tab(self) -> QWidget:
+        w = QWidget()
+        self.jarvis_tab = w 
+        outer = QVBoxLayout(w)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(6)
 
+        # ---- toolbar ----
+        bar = QHBoxLayout()
+        self.jarvis_status = QLabel("Idle")
+        self.jarvis_status.setStyleSheet(
+            "color: #888; font-family: monospace; font-size: 12px;"
+        )
+        bar.addWidget(QLabel("وضعیت:"))
+        bar.addWidget(self.jarvis_status, 1)
+
+        open_cfg = QPushButton("باز کردن فایل تنظیمات")
+        apply_button_style(open_cfg, "neutral")
+        open_cfg.clicked.connect(self._open_jarvis_config)
+        bar.addWidget(open_cfg)
+        outer.addLayout(bar)
+
+        if not JARVIS_AVAILABLE:
+            msg = QLabel(
+                "Jarvis نصب نیست. برای فعال‌سازی حالت زنده، پکیج را نصب کنید."
+            )
+            msg.setWordWrap(True)
+            msg.setStyleSheet("color: #c98a00; padding: 20px;")
+            outer.addWidget(msg)
+            outer.addStretch(1)
+            return w
+
+        # ---- main splitter: transcript | right column ----
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        self.jarvis_transcript = QTextEdit()
+        self.jarvis_transcript.setReadOnly(True)
+        self.jarvis_transcript.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.jarvis_transcript.setLayoutDirection(
+            Qt.LayoutDirection.RightToLeft
+        )
+        mono = _pick_mono_font()
+        if mono:
+            self.jarvis_transcript.setFont(QFont(mono, 10))
+        self.jarvis_transcript.setStyleSheet(
+            "QTextEdit { background: #111; color: #e0e0e0; }"
+        )
+        splitter.addWidget(self.jarvis_transcript)
+
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.setSpacing(4)
+
+        self.jarvis_decisions = QTextEdit()
+        self.jarvis_decisions.setReadOnly(True)
+        self.jarvis_decisions.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        if mono:
+            self.jarvis_decisions.setFont(QFont(mono, 10))
+        self.jarvis_decisions.setStyleSheet(
+            "QTextEdit { background: #0a0a0a; color: #cfcfcf; }"
+        )
+        rv.addWidget(self.jarvis_decisions, 3)
+
+        self.jarvis_pending_header = QLabel("تاییدهای در انتظار  (هیچ)")
+        self.jarvis_pending_header.setStyleSheet(
+            "color: #888; font-family: monospace; font-size: 11px; "
+            "padding: 4px 8px;"
+        )
+        rv.addWidget(self.jarvis_pending_header)
+
+        self.jarvis_pending_view = QTextEdit()
+        self.jarvis_pending_view.setReadOnly(True)
+        self.jarvis_pending_view.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        if mono:
+            self.jarvis_pending_view.setFont(QFont(mono, 10))
+        self.jarvis_pending_view.setStyleSheet(
+            "QTextEdit { background: #0a0a0a; color: #ffd166; }"
+        )
+        rv.addWidget(self.jarvis_pending_view, 1)
+
+        hint = QLabel("Enter برای تایید اولی · Esc برای رد کردن")
+        hint.setStyleSheet(
+            "color: #555; font-family: monospace; font-size: 10px; "
+            "padding: 2px 8px;"
+        )
+        rv.addWidget(hint)
+
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        outer.addWidget(splitter, 1)
+
+        # ---- bridge wiring ----
+        self.jarvis_bridge.status.connect(self.jarvis_status.setText)
+        self.jarvis_bridge.transcript.connect(self._on_jarvis_transcript)
+        self.jarvis_bridge.decision.connect(self._on_jarvis_decision)
+        self.jarvis_bridge.pending_added.connect(self._on_jarvis_pending_added)
+        self.jarvis_bridge.pending_removed.connect(
+            self._on_jarvis_pending_removed
+        )
+
+        return w
+    
     def _build_debug_tab(self) -> QWidget:
         w = QWidget()
         v = QVBoxLayout(w)
@@ -1507,7 +1637,8 @@ class SkyroomGUI(QMainWindow):
             "(درایور داخلی، سپس نسخه سازگار — نیاز به اینترنت فقط بار اول)",
         )
 
-        self.bot = SkyroomBot(cfg, self.users, self._emit_log)
+        self.bot = SkyroomBot(cfg, self.users, self._emit_log,
+                              jarvis=self.jarvis)
 
         # Environment problems the user can actually fix, in plain language,
         # before a single browser window opens.
@@ -2291,6 +2422,92 @@ class SkyroomGUI(QMainWindow):
                 self.log_view.verticalScrollBar().maximum()
             )
 
+    def _on_jarvis_transcript(self, text: str, seconds: float) -> None:
+        ts = time.strftime("%H:%M:%S")
+        cursor = self.jarvis_transcript.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor("#666"))
+        cursor.insertText(f"[{ts} {seconds:.1f}s] ", fmt)
+        fmt.setForeground(QColor("#d0d0d0"))
+        cursor.insertText(text + "\n", fmt)
+        self.jarvis_transcript.verticalScrollBar().setValue(
+            self.jarvis_transcript.verticalScrollBar().maximum()
+        )
+
+    def _on_jarvis_decision(self, decision) -> None:
+        action = getattr(decision, "action", "?")
+        args = getattr(decision, "args", {}) or {}
+        reasoning = getattr(decision, "reasoning", "")
+        ts = time.strftime("%H:%M:%S")
+
+        cursor = self.jarvis_decisions.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+
+        fmt_ts = QTextCharFormat()
+        fmt_ts.setForeground(QColor("#555"))
+        cursor.insertText(f"\n[{ts}]\n", fmt_ts)
+
+        fmt_act = QTextCharFormat()
+        fmt_act.setForeground(QColor("#7fd67f"))
+        cursor.insertText(f"ACTION: {action}\n", fmt_act)
+
+        fmt_args = QTextCharFormat()
+        fmt_args.setForeground(QColor("#e0e0e0"))
+        cursor.insertText(f"ARGS:   {args}\n", fmt_args)
+
+        if reasoning:
+            fmt_why = QTextCharFormat()
+            fmt_why.setForeground(QColor("#888"))
+            cursor.insertText(f"WHY:    {reasoning}\n", fmt_why)
+
+        self.jarvis_decisions.verticalScrollBar().setValue(
+            self.jarvis_decisions.verticalScrollBar().maximum()
+        )
+
+    def _on_jarvis_pending_added(self, action_id: int, desc: str) -> None:
+        self._jarvis_pending_ids.append(action_id)
+        self._render_jarvis_pending()
+
+    def _on_jarvis_pending_removed(self, action_id: int) -> None:
+        if action_id in self._jarvis_pending_ids:
+            self._jarvis_pending_ids.remove(action_id)
+        self._render_jarvis_pending()
+
+    def _render_jarvis_pending(self) -> None:
+        self.jarvis_pending_view.clear()
+        if not self._jarvis_pending_ids:
+            self.jarvis_pending_header.setText("تاییدهای در انتظار  (هیچ)")
+            return
+        self.jarvis_pending_header.setText(
+            f"تاییدهای در انتظار  ({len(self._jarvis_pending_ids)})"
+        )
+        cursor = self.jarvis_pending_view.textCursor()
+        for i, pid in enumerate(self._jarvis_pending_ids):
+            prefix = "▶ " if i == 0 else "   "
+            fmt = QTextCharFormat()
+            fmt.setForeground(QColor("#ffd166"))
+            cursor.insertText(f"{prefix}id={pid}\n", fmt)
+
+    def _open_jarvis_config(self) -> None:
+        path = Path.home() / ".jarvis" / "config.json"
+        if not path.exists():
+            try:
+                from jarvis import config as _jcfg  # noqa: F401
+            except Exception as e:
+                QMessageBox.warning(
+                    self, "Jarvis",
+                    f"فایل تنظیمات ساخته نشد: {e}",
+                )
+                return
+        if not path.exists():
+            QMessageBox.warning(
+                self, "Jarvis",
+                "فایل تنظیمات ساخته نشد. مطمئن شوید Jarvis نصب است.",
+            )
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
     def _clear_log(self):
         self.log_view.clear()
 
@@ -2368,6 +2585,42 @@ class SkyroomGUI(QMainWindow):
         )
         if r == QMessageBox.StandardButton.Yes:
             QDesktopServices.openUrl(QUrl(GITHUB_URL))
+
+    def keyPressEvent(self, event):
+        try:
+            on_jarvis_tab = (
+            hasattr(self, "tabs")
+            and hasattr(self, "jarvis_tab")
+            and self.tabs.currentWidget() is self.jarvis_tab
+        )
+        except Exception:
+            on_jarvis_tab = False
+
+        if (hasattr(self, "_jarvis_pending_ids")
+                and self._jarvis_pending_ids
+                and on_jarvis_tab):
+            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self._jarvis_approve_top()
+                return
+            if event.key() == Qt.Key.Key_Escape:
+                self._jarvis_dismiss_top()
+                return
+
+        super().keyPressEvent(event)
+
+    def _jarvis_approve_top(self) -> None:
+        if not self._jarvis_pending_ids:
+            return
+        pid = self._jarvis_pending_ids[0]
+        kind = self.jarvis.approve(pid)
+        self._append_log("INFO", f"تایید Jarvis id={pid} ({kind})")
+
+    def _jarvis_dismiss_top(self) -> None:
+        if not self._jarvis_pending_ids:
+            return
+        pid = self._jarvis_pending_ids[0]
+        self.jarvis.dismiss(pid)
+        self._append_log("INFO", f"رد کردن Jarvis id={pid}")
 
     def closeEvent(self, event):
         if self.bot is not None:

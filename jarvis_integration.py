@@ -5,9 +5,13 @@ Owns the single Listener instance that can run at a time, routes its
 decisions through an Executor, and queues driver actions for the task
 thread to execute.
 
-Phase 2: decisions now reach the driver. type_number and send_chat
-queue a work item; the SkyroomBot task thread drains the queue in its
-stay-in-room loop and drives the chat box.
+Optional GUI callbacks:
+    on_status(str)
+    on_transcript(text, seconds)
+    on_decision(decision_obj)
+    on_pending_added(id, description)
+    on_pending_removed(id)
+Set them after construction; they fire on the listener thread.
 """
 
 from __future__ import annotations
@@ -40,6 +44,16 @@ Executor: Any = _Executor
 LogCallback = Callable[[str, str], None]
 
 
+def _format_pending(decision) -> str:
+    action = getattr(decision, "action", "?")
+    args = getattr(decision, "args", {}) or {}
+    if action == "type_number":
+        return f"type_number  n = {args.get('n')}"
+    if action == "send_chat":
+        return f"send_chat  \"{args.get('text')}\""
+    return f"{action}  {args}"
+
+
 # ---------------------------------------------------------------------------
 # Skyroom backend
 # ---------------------------------------------------------------------------
@@ -65,21 +79,19 @@ class SkyroomBackend:
 # JarvisRuntime
 # ---------------------------------------------------------------------------
 class JarvisRuntime:
-    """
-    Coordinates the one Listener that can run at a time and routes its
-    decisions through an Executor.
-
-    Loopback capture is a single global input, so two classes cannot
-    listen simultaneously. The first task to acquire a lease gets it;
-    any other task is told no and continues without Jarvis.
-    """
-
     def __init__(self, log_cb: LogCallback) -> None:
         self.log_cb = log_cb
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._listener = None
         self._executor = None
         self._active_tag: Optional[str] = None
+
+        # Optional GUI callbacks — set by the window after construction.
+        self.on_status: Optional[Callable[[str], None]] = None
+        self.on_transcript: Optional[Callable[[str, float], None]] = None
+        self.on_decision: Optional[Callable[[Any], None]] = None
+        self.on_pending_added: Optional[Callable[[int, str], None]] = None
+        self.on_pending_removed: Optional[Callable[[int], None]] = None
 
     # ------------------------------------------------------------------
     @property
@@ -97,13 +109,21 @@ class JarvisRuntime:
             return self._active_tag
 
     # ------------------------------------------------------------------
+    def _safe_call(self, cb, *args) -> None:
+        if cb is None:
+            return
+        try:
+            cb(*args)
+        except Exception as e:
+            self.log_cb("ERROR", f"jarvis callback failed: {e}")
+
+    # ------------------------------------------------------------------
     def acquire(
         self,
         tag: str,
         user_dict: dict,
         work_queue: "queue.Queue[tuple[str, dict]]",
     ) -> bool:
-        """Start a Listener for this task. True if granted."""
         if not JARVIS_AVAILABLE:
             self.log_cb(
                 "WARNING",
@@ -132,10 +152,10 @@ class JarvisRuntime:
                 listener = Listener(
                     context=ctx,
                     on_decision=lambda d: self._on_decision(tag, d),
+                    on_transcript=lambda t, s: self._on_transcript(t, s),
                     on_error=lambda e: self.log_cb(
                         "ERROR", f"{tag} jarvis: {e}"
                     ),
-                    
                     alarm=True,
                 )
                 listener.start(wait=0.0)
@@ -146,42 +166,47 @@ class JarvisRuntime:
             self._listener = listener
             self._executor = executor
             self._active_tag = tag
-            self.log_cb(
-                "INFO",
-                f"{tag} Jarvis listening as {ctx.user_name}",
-            )
-            return True
+
+        self.log_cb("INFO", f"{tag} Jarvis listening as {ctx.user_name}")
+        self._safe_call(self.on_status, f"Listening — {ctx.user_name}")
+        return True
 
     # ------------------------------------------------------------------
     def release(self, tag: str) -> None:
         with self._lock:
             if self._listener is None or self._active_tag != tag:
                 return
-            try:
-                self._listener.stop(timeout=3.0)
-            except Exception:
-                pass
+            listener = self._listener
             self._listener = None
             self._executor = None
             self._active_tag = None
-            self.log_cb("INFO", f"{tag} Jarvis listener stopped")
+
+        try:
+            listener.stop(timeout=3.0)
+        except Exception:
+            pass
+        self.log_cb("INFO", f"{tag} Jarvis listener stopped")
+        self._safe_call(self.on_status, "Idle")
 
     # ------------------------------------------------------------------
-    # Confirm queue
+    # Confirm queue (called from the GUI / main thread)
     # ------------------------------------------------------------------
     def approve(self, action_id: int) -> str:
         with self._lock:
             if self._executor is None:
                 return "unavailable"
             outcome = self._executor.approve(action_id)
-            return getattr(outcome, "value", str(outcome))
+            kind = getattr(outcome, "value", str(outcome))
+        self._safe_call(self.on_pending_removed, action_id)
+        return kind
 
     def dismiss(self, action_id: int) -> str:
         with self._lock:
             if self._executor is None:
                 return "unavailable"
             self._executor.dismiss(action_id)
-            return "dismissed"
+        self._safe_call(self.on_pending_removed, action_id)
+        return "dismissed"
 
     def pending(self) -> list:
         with self._lock:
@@ -190,49 +215,51 @@ class JarvisRuntime:
             return self._executor.pending()
 
     # ------------------------------------------------------------------
+    # Listener thread callbacks
+    # ------------------------------------------------------------------
+    def _on_transcript(self, text: str, seconds: float) -> None:
+        self._safe_call(self.on_transcript, text, seconds)
+
     def _on_decision(self, tag: str, decision) -> None:
-        """Called on the Listener's thread for every decision."""
-        try:
-            action = getattr(decision, "action", "?")
-            args = getattr(decision, "args", {})
+        action = getattr(decision, "action", "?")
+        args = getattr(decision, "args", {}) or {}
 
-            if action == "notify_me":
-                self.log_cb(
-                    "INFO",
-                    f"{tag} [jarvis] notify_me  {args}",
-                )
-                return
+        # notify_me: observation only, no execution.
+        if action == "notify_me":
+            self.log_cb("INFO", f"{tag} [jarvis] notify_me {args}")
+            self._safe_call(self.on_decision, decision)
+            return
 
-            with self._lock:
-                executor = self._executor
+        # Executable actions — submit inside the lock so approve()
+        # on the main thread can't race us modifying the pending list.
+        with self._lock:
+            executor = self._executor
             if executor is None:
                 return
-
             outcome = executor.submit(decision)
             kind = getattr(outcome, "value", str(outcome))
-
+            pending_id = None
             if kind == "pending":
-                with self._lock:
-                    pending = executor.pending()
-                pid = pending[-1].id if pending else -1
-                self.log_cb(
-                    "INFO",
-                    f"{tag} [jarvis] {action} {args}  [pending id={pid}]",
+                pl = executor.pending()
+                if pl:
+                    pending_id = pl[-1].id
+
+        if kind == "pending":
+            self.log_cb(
+                "INFO",
+                f"{tag} [jarvis] {action} {args}  [pending id={pending_id}]",
+            )
+            if pending_id is not None:
+                self._safe_call(
+                    self.on_pending_added, pending_id, _format_pending(decision)
                 )
-            elif kind == "executed":
-                self.log_cb(
-                    "INFO",
-                    f"{tag} [jarvis] {action} {args}  [executed]",
-                )
-            elif kind == "skipped":
-                self.log_cb(
-                    "INFO",
-                    f"{tag} [jarvis] {action} {args}  [skipped]",
-                )
-            else:
-                self.log_cb(
-                    "WARNING",
-                    f"{tag} [jarvis] {action} {args}  [{kind}]",
-                )
-        except Exception as e:
-            self.log_cb("ERROR", f"{tag} jarvis decision failed: {e}")
+        elif kind == "executed":
+            self.log_cb("INFO", f"{tag} [jarvis] {action} {args}  [executed]")
+        elif kind == "skipped":
+            self.log_cb("INFO", f"{tag} [jarvis] {action} {args}  [skipped]")
+        else:
+            self.log_cb(
+                "WARNING", f"{tag} [jarvis] {action} {args}  [{kind}]"
+            )
+
+        self._safe_call(self.on_decision, decision)

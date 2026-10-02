@@ -339,21 +339,20 @@ class SkyroomBot:
     def __init__(self,
                  config: RuntimeConfig,
                  users: List[dict],
-                 log_cb: Callable[[str, str], None]):
+                 log_cb: Callable[[str, str], None],
+                 jarvis: Optional["JarvisRuntime"] = None):
         self.cfg = config.effective()
         self.users = users
         self.log_cb = log_cb
+        self.jarvis = jarvis if jarvis is not None else JarvisRuntime(log_cb)
         self.stop_event = threading.Event()
         self.threads: List[threading.Thread] = []
         self.active_drivers: set = set()
         self._drivers_lock = threading.Lock()
-        # Driver discovery happens once per run and is shared by every task
-        # thread (see _resolve_driver).
         self._driver_lock = threading.Lock()
         self._driver_ready = threading.Event()
         self._driver_path: Optional[str] = None
         self._sm_lock = threading.Lock()
-        self.jarvis = JarvisRuntime(self._log)
 
     # ----- public API -----
     def start(self) -> List[Task]:
