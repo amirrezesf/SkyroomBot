@@ -13,16 +13,20 @@ CHROMEDRIVER = ("drivers/chromedriver.exe" if sys.platform == "win32"
 
 WITH_JARVIS = os.environ.get("BUILD_VARIANT") == "full"
 
-# ---- base data + hidden imports ----
+# =========================================================
+# Data files and hidden imports
+# =========================================================
+# Note: no collect_data_files("PyQt6"). PyInstaller's built-in PyQt6
+# hook collects only the Qt libraries the imported modules actually
+# need. Wholesale collection would pull in Bluetooth, WebEngine,
+# Sensors, and other unused libraries — inflating the binary and
+# breaking onefile extraction.
 datas = [
     (str(CHROMEDRIVER), "drivers"),
     ("assets/icon-512.png", "assets"),
-] + collect_data_files("PyQt6")
+]
 
 hiddenimports = [
-    "PyQt6.QtCore",
-    "PyQt6.QtGui",
-    "PyQt6.QtWidgets",
     "selenium.webdriver.chrome.service",
     "selenium.webdriver.chrome.options",
     "selenium.webdriver.common.by",
@@ -34,24 +38,18 @@ hiddenimports = [
 
 binaries = []
 
-# ---- Jarvis bundle (full variant only) ----
+# =========================================================
+# Jarvis bundle (full variant only)
+# =========================================================
 if WITH_JARVIS:
-    import jarvis  # noqa: F401  (fail loudly if not installed)
+    import jarvis  # noqa: F401
 
-    jarvis_root = Path(jarvis.__file__).parent
-
-    # Package code, including sub-packages the try/except hides from
-    # PyInstaller's static analysis.
     hiddenimports += collect_submodules("jarvis")
-
-    # The packaged alarm sound lives under jarvis/assets, not as a module.
     datas += collect_data_files("jarvis")
 
-    # Runtime dependencies that load native code dynamically.
     hiddenimports += [
         "faster_whisper",
         "ctranslate2",
-        "silero_vad",
         "sounddevice",
         "soundfile",
         "onnxruntime",
@@ -63,20 +61,18 @@ if WITH_JARVIS:
         "dotenv",
     ]
     hiddenimports += collect_submodules("faster_whisper")
-    hiddenimports += collect_submodules("silero_vad")
     hiddenimports += collect_submodules("ctranslate2")
 
-    # Native shared libraries.
     binaries += collect_dynamic_libs("ctranslate2")
     binaries += collect_dynamic_libs("soundfile")
     binaries += collect_dynamic_libs("sounddevice")
+    binaries += collect_dynamic_libs("onnxruntime")
 
-    # silero-vad and faster-whisper ship small data files (ONNX model,
-    # tokenizer config, etc.) that must be copied next to the module.
-    datas += collect_data_files("silero_vad")
     datas += collect_data_files("faster_whisper")
 
-# ---- Analysis ----
+# =========================================================
+# Analysis
+# =========================================================
 a = Analysis(
     ["pyqt.py"],
     pathex=[],
@@ -88,26 +84,109 @@ a = Analysis(
     excludes=[
         "PyQt6.QtWebEngineCore",
         "PyQt6.QtWebEngineWidgets",
+        "PyQt6.QtWebEngineQuick",
+        "PyQt6.QtWebChannel",
+        "PyQt6.QtWebSockets",
         "PyQt6.QtQml",
         "PyQt6.QtQuick",
+        "PyQt6.QtQuick3D",
+        "PyQt6.QtQuickWidgets",
+        "PyQt6.QtBluetooth",
+        "PyQt6.QtNetworkAuth",
+        "PyQt6.QtNfc",
+        "PyQt6.QtPositioning",
+        "PyQt6.QtPositioningQuick",
+        "PyQt6.QtRemoteObjects",
+        "PyQt6.QtSensors",
+        "PyQt6.QtSensorQuick",
+        "PyQt6.QtSerialPort",
+        "PyQt6.QtSerialBus",
+        "PyQt6.QtSql",
+        "PyQt6.QtTest",
+        "PyQt6.QtTextToSpeech",
+        "PyQt6.QtCharts",
+        "PyQt6.QtDataVisualization",
+        "PyQt6.QtGraphs",
+        "PyQt6.QtMultimedia",
+        "PyQt6.QtMultimediaWidgets",
+        "PyQt6.QtOpenGL",
+        "PyQt6.QtOpenGLWidgets",
+        "PyQt6.QtPdf",
+        "PyQt6.QtPdfWidgets",
+        "PyQt6.QtDesigner",
+        "PyQt6.QtHelp",
+        "PyQt6.QtUiTools",
+        "PyQt6.QtSvg",
+        "PyQt6.QtSvgWidgets",
+
+        "nvidia",
+        "nvidia.cublas",
+        "nvidia.cudnn",
+
+        "torch",
+        "torchaudio",
+        "torchvision",
+        "transformers",
+        "tensorflow",
+        "matplotlib",
+        "scipy",
+        "pandas",
+        "IPython",
+        "jupyter",
+        "pytest",
+        "tkinter",
+        "PySide6",
+        "PyQt5",
+
+        "setuptools",
+        "pip",
+        "wheel",
     ],
     noarchive=False,
 )
 
 pyz = PYZ(a.pure)
 
-exe = EXE(
-    pyz,
-    a.scripts,
-    a.binaries,
-    a.datas,
-    [],
-    name="SkyroomBot",
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=True,
-    console=False,
-    windowed=True,
-    icon="assets/icon.ico",
-)
+# =========================================================
+# Output: full = onedir, base = onefile
+# =========================================================
+if WITH_JARVIS:
+    exe = EXE(
+        pyz,
+        a.scripts,
+        [],
+        exclude_binaries=True,
+        name="SkyroomBot",
+        debug=False,
+        bootloader_ignore_signals=False,
+        strip=False,
+        upx=False,
+        console=False,
+        windowed=True,
+        icon="assets/icon.ico",
+    )
+
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.datas,
+        strip=False,
+        upx=False,
+        name="SkyroomBot",
+    )
+else:
+    exe = EXE(
+        pyz,
+        a.scripts,
+        a.binaries,
+        a.datas,
+        [],
+        name="SkyroomBot",
+        debug=False,
+        bootloader_ignore_signals=False,
+        strip=False,
+        upx=False,
+        console=False,
+        windowed=True,
+        icon="assets/icon.ico",
+    )
