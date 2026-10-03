@@ -1402,7 +1402,8 @@ class SkyroomGUI(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_general_tab(), "عمومی")
         self.tabs.addTab(self._build_wake_tab(), "خواب و بیدارباش")
-        self.tabs.addTab(self._build_jarvis_tab(), "Jarvis (دستیار صوتی)")   # <-- new
+        if JARVIS_AVAILABLE:
+            self.tabs.addTab(self._build_jarvis_tab(), "Jarvis (دستیار صوتی)")
         self.tabs.addTab(self._build_debug_tab(), "اشکال‌زدایی")
         self.tabs.addTab(self._build_log_tab(), "گزارش")
         v.addWidget(self.tabs)

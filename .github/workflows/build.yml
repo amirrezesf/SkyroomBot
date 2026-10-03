@@ -2,16 +2,16 @@ name: Build & Release
 
 on:
   push:
-    branches: [ main, master, with_jarvis ]
+    branches: [ main, master ]
     tags:     [ 'v*' ]
   workflow_dispatch:
     inputs:
       build_base:
-        description: 'Build base variant (main branch)'
+        description: 'Build base variant'
         type: boolean
         default: true
       build_full:
-        description: 'Build full variant (with_jarvis branch)'
+        description: 'Build full variant (with Jarvis)'
         type: boolean
         default: true
 
@@ -109,22 +109,18 @@ jobs:
             platform: linux
             ext: ""
             variant: base
-            branch: main
           - os: ubuntu-latest
             platform: linux
             ext: ""
             variant: full
-            branch: with_jarvis
           - os: windows-latest
             platform: windows
             ext: ".exe"
             variant: base
-            branch: main
           - os: windows-latest
             platform: windows
             ext: ".exe"
             variant: full
-            branch: with_jarvis
 
     steps:
       - name: Skip if this variant is not requested
@@ -138,11 +134,10 @@ jobs:
           esac
           echo "enabled=$FLAG" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout target branch
+      - name: Checkout current commit
         if: steps.gate.outputs.enabled == 'true'
         uses: actions/checkout@v4
         with:
-          ref: ${{ matrix.branch }}
           fetch-depth: 0
 
       - name: Setup Python
