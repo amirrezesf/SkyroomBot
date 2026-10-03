@@ -164,7 +164,7 @@ jobs:
           steps.gate.outputs.enabled == 'true' &&
           matrix.variant == 'full'
         run: |
-          pip install "git+https://github.com/amirrezesf/Jarvis.git@v0.1.0"
+          pip install "git+https://github.com/amirrezesf/Jarvis.git@v0.2.0"
 
       - name: Download matching chromedriver
         if: steps.gate.outputs.enabled == 'true'
