@@ -1,11 +1,9 @@
-Lvenv/
 venv/
-venv
-Lvenv
+Lvenv/
 __pycache__/
 *.pyc
 drivers/
 dist/
 build/
-info.md
+logs/
 structure.json
