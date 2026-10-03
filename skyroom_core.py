@@ -7,6 +7,7 @@ Each class has a start time and an end time on the same Persian weekday.
 
 import os
 from pathlib import Path
+import queue
 import random
 import shutil
 import subprocess
@@ -18,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, time as dtime
 from typing import Callable, List, Optional
 from zoneinfo import ZoneInfo
-
+from jarvis_integration import JarvisRuntime, JARVIS_AVAILABLE
 from selenium import webdriver
 from selenium.common.exceptions import (
     NoSuchElementException,
@@ -268,6 +269,11 @@ class Task:
     end_time: datetime                  # class end   (Tehran tz)
     actual_time: datetime = field(init=False)
     message_sent: bool = field(default=False, init=False)
+    user_dict: dict = field(default_factory=dict)   
+    live: bool = False                              
+    work_queue: "queue.Queue[tuple[str, dict]] | None" = field(
+        default=None, init=False,
+    )
 
     def compute_actual(self, cfg: RuntimeConfig) -> None:
         """
@@ -333,16 +339,16 @@ class SkyroomBot:
     def __init__(self,
                  config: RuntimeConfig,
                  users: List[dict],
-                 log_cb: Callable[[str, str], None]):
+                 log_cb: Callable[[str, str], None],
+                 jarvis: Optional["JarvisRuntime"] = None):
         self.cfg = config.effective()
         self.users = users
         self.log_cb = log_cb
+        self.jarvis = jarvis if jarvis is not None else JarvisRuntime(log_cb)
         self.stop_event = threading.Event()
         self.threads: List[threading.Thread] = []
         self.active_drivers: set = set()
         self._drivers_lock = threading.Lock()
-        # Driver discovery happens once per run and is shared by every task
-        # thread (see _resolve_driver).
         self._driver_lock = threading.Lock()
         self._driver_ready = threading.Event()
         self._driver_path: Optional[str] = None
@@ -421,7 +427,9 @@ class SkyroomBot:
                     class_name=cls_name,
                     url=cls.get("url", "").strip(),
                     scheduled_time=start_dt,
-                    end_time=end_dt,
+                    end_time=end_dt, 
+                    user_dict=user,                        
+                    live=bool(cls.get("live", False)), 
                 )
                 tasks.append(task)
         return tasks
@@ -551,19 +559,20 @@ class SkyroomBot:
         return env
 
     def get_chromedriver_path(self):
-        if getattr(sys, 'frozen', False):
-            base = Path(sys._MEIPASS)
-            name = 'chromedriver.exe' if sys.platform == 'win32' else 'chromedriver'
-            p = base / 'drivers' / name
-            if p.exists():
-                return str(p)
+        if getattr(sys, "frozen", False):
+            base_dir = getattr(sys, "_MEIPASS", None)
+            if base_dir:
+                name = ("chromedriver.exe" if sys.platform == "win32"
+                        else "chromedriver")
+                p = Path(base_dir) / "drivers" / name
+                if p.exists():
+                    return str(p)
         # dev mode
         local = Path(__file__).parent / 'drivers' / (
             'chromedriver.exe' if sys.platform == 'win32' else 'chromedriver')
         if local.exists():
             return str(local)
         return None    # fall back to Selenium Manager
-
     # ----- driver discovery (once per run, shared by every task) -----
     @staticmethod
     def _chrome_binary() -> Optional[str]:
@@ -899,7 +908,12 @@ class SkyroomBot:
             if not self._safe_click(driver, confirm_btn):
                 raise WebDriverException("could not click nickname-confirm")
             self._log("INFO", f"{tag} nickname confirmed")
-
+            jarvis_active = False
+            if task.live:
+                task.work_queue = queue.Queue()
+                jarvis_active = self.jarvis.acquire(
+                    tag, task.user_dict, task.work_queue,
+                )
             # STEP 3 - chat message (optional)
             if not self.cfg.send_message:
                 if not getattr(task, "_skip_msg_logged", False):
@@ -939,60 +953,67 @@ class SkyroomBot:
 
             stream_started = False
             checks_without_stream = 0
-            while True:
-                if datetime.now(TEHRAN_TZ) >= task.end_time:
-                    self._log("INFO", f"{tag} end time reached — closing session")
-                    return "ENDED"
+            try:
+                while True:
+                    if datetime.now(TEHRAN_TZ) >= task.end_time:
+                        self._log("INFO",
+                                  f"{tag} end time reached — closing session")
+                        return "ENDED"
 
-                if self.stop_event.wait(self.cfg.ws_check_interval):
-                    return "STOPPED"
+                    # Shorter poll when Jarvis is active so decisions are
+                    # logged promptly. The loop body itself is cheap.
+                    interval = 1.0 if jarvis_active else self.cfg.ws_check_interval
+                    if self.stop_event.wait(interval):
+                        return "STOPPED"
 
-                if self.cfg.debug_disable_ws_check:
-                    continue
+                    if jarvis_active and task.work_queue is not None:
+                        self._drain_action_queue(driver, task.work_queue, tag)
 
-                if not stream_started:
+                    if self.cfg.debug_disable_ws_check:
+                        continue
+                    if not stream_started:
+                        try:
+                            opened = driver.execute_script(
+                                "return window.__wsOpened || 0;"
+                            )
+                        except WebDriverException:
+                            return "RETRY"
+                        if opened and opened > 0:
+                            stream_started = True
+                            self._log("INFO",
+                                      f"{tag} stream detected "
+                                      f"({opened} socket(s)) — monitoring")
+                        else:
+                            checks_without_stream += 1
+                            waited = (checks_without_stream
+                                      * interval)
+                            if checks_without_stream in (6, 24):
+                                self._log(
+                                    "WARNING",
+                                    f"{tag} no class media socket after "
+                                    f"{waited // 60} min — login may have "
+                                    f"failed; check the browser window")
+                        continue
+
+                    if self._ws_is_dead(driver):
+                        self._log("WARNING",
+                                  f"{tag} WebSocket interrupted — restarting")
+                        return "RETRY"
+
                     try:
-                        opened = driver.execute_script(
-                            "return window.__wsOpened || 0;"
+                        alive = driver.execute_script(
+                            "return !!document.querySelector('.roomTimer') "
+                            "|| !!document.querySelector('#txt_input');"
                         )
+                        if not alive:
+                            self._log("WARNING",
+                                      f"{tag} room DOM vanished — restarting")
+                            return "RETRY"
                     except WebDriverException:
                         return "RETRY"
-                    if opened and opened > 0:
-                        stream_started = True
-                        self._log("INFO",
-                                  f"{tag} stream detected "
-                                  f"({opened} socket(s)) — monitoring")
-                    else:
-                        # Don't spin silently until end_time if the class
-                        # page never actually opened — say so once, then
-                        # again later, so a failed login is visible.
-                        checks_without_stream += 1
-                        waited = (checks_without_stream
-                                  * self.cfg.ws_check_interval)
-                        if checks_without_stream in (6, 24):
-                            self._log(
-                                "WARNING",
-                                f"{tag} no class media socket after "
-                                f"{waited // 60} min — login may have "
-                                f"failed; check the browser window")
-                    continue
-
-                if self._ws_is_dead(driver):
-                    self._log("WARNING",
-                              f"{tag} WebSocket interrupted — restarting")
-                    return "RETRY"
-
-                try:
-                    alive = driver.execute_script(
-                        "return !!document.querySelector('.roomTimer') "
-                        "|| !!document.querySelector('#txt_input');"
-                    )
-                    if not alive:
-                        self._log("WARNING",
-                                  f"{tag} room DOM vanished — restarting")
-                        return "RETRY"
-                except WebDriverException:
-                    return "RETRY"
+            finally:
+                if jarvis_active:
+                    self.jarvis.release(tag)
         finally:
             self._unregister_driver(driver)
             try:
@@ -1000,7 +1021,49 @@ class SkyroomBot:
             except Exception:
                 pass
             self._log("INFO", f"{tag} browser closed")
+    def _drain_action_queue(
+        self, driver, work_queue: "queue.Queue[tuple[str, dict]]", tag: str,
+    ) -> None:
+        """Execute any driver actions queued by the Jarvis backend."""
+        while True:
+            try:
+                action, args = work_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                if action == "type_number":
+                    self._send_chat(driver, str(args.get("n", "")))
+                    self._log("INFO",
+                              f"{tag} [jarvis] typed: {args.get('n')}")
+                elif action == "send_chat":
+                    self._send_chat(driver, str(args.get("text", "")))
+                    self._log("INFO",
+                              f"{tag} [jarvis] sent: {args.get('text')}")
+                else:
+                    self._log("WARNING",
+                              f"{tag} [jarvis] unknown action {action!r}")
+            except Exception as e:
+                self._log("ERROR",
+                          f"{tag} [jarvis] {action} failed: {e}")
 
+    def _send_chat(self, driver, text: str) -> None:
+        """Type text into the Skyroom chat box and press Enter."""
+        wait = WebDriverWait(driver, self.cfg.element_timeout)
+        chat_input = wait.until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, "#txt_input"))
+        )
+        # Clear any leftover text — handles both input.value and contenteditable.
+        try:
+            driver.execute_script(
+                "var el = document.querySelector('#txt_input'); "
+                "if (el) { if ('value' in el) el.value = ''; "
+                "el.textContent = ''; }"
+            )
+        except WebDriverException:
+            pass
+        chat_input.click()
+        chat_input.send_keys(text)
+        chat_input.send_keys(Keys.ENTER)
     def _ws_is_dead(self, driver) -> bool:
         if self.cfg.debug_disable_ws_check:
             return False

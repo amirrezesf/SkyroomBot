@@ -27,6 +27,20 @@ PLATFORMS = {
 }
 
 
+import os
+import socks
+import socket
+
+_proxy = os.environ.get("ALL_PROXY") or os.environ.get("HTTPS_PROXY")
+if _proxy and _proxy.startswith("socks"):
+    # Parse socks5h://host:port
+    _host_port = _proxy.split("://", 1)[1]
+    _host, _port = _host_port.rsplit(":", 1)
+    socks.set_default_proxy(socks.SOCKS5, _host, int(_port),
+                            rdns=True)
+    socket.socket = socks.socksocket
+
+
 def main() -> int:
     system = platform.system()
     if system not in PLATFORMS:
