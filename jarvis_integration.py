@@ -54,13 +54,9 @@ def _format_pending(decision) -> str:
     return f"{action}  {args}"
 
 
-# ---------------------------------------------------------------------------
-# Skyroom backend
-# ---------------------------------------------------------------------------
 class SkyroomBackend:
     """
     ActionBackend that queues work for the SkyroomBot task thread.
-
     The queue is drained by the task thread in the stay-in-room loop,
     so every driver call happens on the thread that created the driver.
     """
@@ -75,9 +71,6 @@ class SkyroomBackend:
         self.work_queue.put(("send_chat", {"text": str(text)}))
 
 
-# ---------------------------------------------------------------------------
-# JarvisRuntime
-# ---------------------------------------------------------------------------
 class JarvisRuntime:
     def __init__(self, log_cb: LogCallback) -> None:
         self.log_cb = log_cb
@@ -93,7 +86,6 @@ class JarvisRuntime:
         self.on_pending_added: Optional[Callable[[int, str], None]] = None
         self.on_pending_removed: Optional[Callable[[int], None]] = None
 
-    # ------------------------------------------------------------------
     @property
     def is_available(self) -> bool:
         return JARVIS_AVAILABLE
@@ -108,7 +100,6 @@ class JarvisRuntime:
         with self._lock:
             return self._active_tag
 
-    # ------------------------------------------------------------------
     def _safe_call(self, cb, *args) -> None:
         if cb is None:
             return
@@ -117,7 +108,6 @@ class JarvisRuntime:
         except Exception as e:
             self.log_cb("ERROR", f"jarvis callback failed: {e}")
 
-    # ------------------------------------------------------------------
     def acquire(
         self,
         tag: str,
@@ -171,7 +161,6 @@ class JarvisRuntime:
         self._safe_call(self.on_status, f"Listening — {ctx.user_name}")
         return True
 
-    # ------------------------------------------------------------------
     def release(self, tag: str) -> None:
         with self._lock:
             if self._listener is None or self._active_tag != tag:
@@ -188,9 +177,6 @@ class JarvisRuntime:
         self.log_cb("INFO", f"{tag} Jarvis listener stopped")
         self._safe_call(self.on_status, "Idle")
 
-    # ------------------------------------------------------------------
-    # Confirm queue (called from the GUI / main thread)
-    # ------------------------------------------------------------------
     def approve(self, action_id: int) -> str:
         with self._lock:
             if self._executor is None:
@@ -214,9 +200,6 @@ class JarvisRuntime:
                 return []
             return self._executor.pending()
 
-    # ------------------------------------------------------------------
-    # Listener thread callbacks
-    # ------------------------------------------------------------------
     def _on_transcript(self, text: str, seconds: float) -> None:
         self._safe_call(self.on_transcript, text, seconds)
 

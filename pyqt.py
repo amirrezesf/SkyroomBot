@@ -26,7 +26,7 @@ from pathlib import Path
 
 try:
     from PyQt6.QtCore import (
-        Qt, QTimer, QEventLoop, pyqtSignal, QObject, QSize, QSettings, QUrl
+        Qt, QTimer, QEventLoop, pyqtSignal, QObject, QSettings, QUrl
     )
     from PyQt6.QtGui import (
         QAction, QFont, QColor, QTextCharFormat, QTextCursor,

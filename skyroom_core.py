@@ -18,8 +18,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, time as dtime
 from typing import Callable, List, Optional
-from zoneinfo import ZoneInfo
-from jarvis_integration import JarvisRuntime, JARVIS_AVAILABLE
+from jarvis_integration import JarvisRuntime
 from selenium import webdriver
 from selenium.common.exceptions import (
     NoSuchElementException,
@@ -41,9 +40,8 @@ try:
     from zoneinfo import ZoneInfo
     TEHRAN_TZ = ZoneInfo("Asia/Tehran")
 except Exception:
-    # Fallback: Tehran is UTC+3:30 year-round since 2022
-    # (Iran abolished DST in September 2022)
-    from datetime import timezone, timedelta
+    # Tehran is UTC+3:30 year-round since 2022 (DST abolished)
+    from datetime import timezone
     TEHRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 
 # Python weekday: Monday=0 ... Sunday=6
@@ -114,16 +112,10 @@ def next_occurrence_range(day_name: str,
     """
     Return (start_dt, end_dt) aware datetimes in Tehran tz.
 
-    Unlike next_occurrence(), this function is *class-aware*:
-      - If we are currently INSIDE today's class
-        (today is the class weekday AND start <= now < end),
-        it returns today's range. This is what makes pressing Start
-        mid-class work.
-      - If the class starts later today, it returns today's range.
-      - Otherwise it returns the next upcoming occurrence.
-
-    `end_dt` is on the same weekday as `start_dt`; if the end time is <=
-    start time it rolls to the next day (unusual for classes, but handled).
+    Class-aware: returns today's range when inside today's class (so
+    pressing Start mid-class works) or when the class starts later today;
+    otherwise the next upcoming occurrence. An end time <= start time
+    rolls to the next day.
     """
     day = day_name.strip()
     if day not in PERSIAN_DAYS:
@@ -135,7 +127,6 @@ def next_occurrence_range(day_name: str,
 
     now = datetime.now(TEHRAN_TZ)
 
-    # ---- Candidate: today's (or the next matching weekday's) start ----
     days_ahead = (target_wd - now.weekday()) % 7
     candidate_start = (now + timedelta(days=days_ahead)).replace(
         hour=start_t.hour, minute=start_t.minute, second=0, microsecond=0
@@ -152,27 +143,22 @@ def next_occurrence_range(day_name: str,
 
     candidate_end = _end_for(candidate_start)
 
-    # ---- Case 0: a class that started YESTERDAY evening and is still
-    # running now. It belongs to the previous weekday's occurrence, which
-    # `candidate_start` (built from today's weekday) never looks at, so
-    # without this a 23:00-01:00 class is invisible from 00:00 to 01:00.
+    # A class still running from last week's occurrence (e.g. 23:00-01:00
+    # seen from 00:00-01:00) is invisible to candidate_start.
     prev_start = candidate_start - timedelta(days=7)
     prev_end = _end_for(prev_start)
     if prev_start <= now < prev_end:
         return prev_start, prev_end
 
-    # ---- Case 1: we are inside today's class right now ----
-    # No weekday test here: a class that ends after midnight lives on the
-    # *next* weekday for its second half, so "now.weekday() == target_wd"
-    # would fail at 00:30 for a 23:00-01:00 class and send us a week ahead.
+    # A class that ends after midnight lives on the *next* weekday for its
+    # second half, so "now.weekday() == target_wd" would fail at 00:30 for
+    # a 23:00-01:00 class and send us a week ahead.
     if candidate_start <= now < candidate_end:
         return candidate_start, candidate_end
 
-    # ---- Case 2: class starts in the future (today or later) ----
     if candidate_start > now:
         return candidate_start, candidate_end
 
-    # ---- Case 3: today's class already ended -> next week ----
     candidate_start += timedelta(days=7)
     return candidate_start, _end_for(candidate_start)
 
@@ -182,7 +168,6 @@ def next_occurrence_range(day_name: str,
 # ============================================================
 @dataclass
 class RuntimeConfig:
-    # ---- Chat message ----
     send_message: bool = True
     chat_message: str = "سلام"
 
@@ -195,7 +180,6 @@ class RuntimeConfig:
     min_delay_min: int = 10
     max_delay_min: int = 15
 
-    # ---- Debug master + sub-flags ----
     debug_mode: bool = False
     debug_run_now: bool = False
     debug_disable_random_delay: bool = False
@@ -269,8 +253,8 @@ class Task:
     end_time: datetime                  # class end   (Tehran tz)
     actual_time: datetime = field(init=False)
     message_sent: bool = field(default=False, init=False)
-    user_dict: dict = field(default_factory=dict)   
-    live: bool = False                              
+    user_dict: dict = field(default_factory=dict)
+    live: bool = False
     work_queue: "queue.Queue[tuple[str, dict]] | None" = field(
         default=None, init=False,
     )
@@ -294,12 +278,10 @@ class Task:
         self._compute_actual_at(now, cfg)
 
     def _compute_actual_at(self, now: datetime, cfg: RuntimeConfig) -> None:
-        # Debug: join now
         if cfg.debug_run_now:
             self.actual_time = now
             return
 
-        # Debug: fixed time (= class start, or now if start already passed)
         if cfg.debug_disable_random_delay:
             self.actual_time = max(self.scheduled_time, now)
             if self.actual_time >= self.end_time and now < self.end_time:
@@ -312,22 +294,17 @@ class Task:
         window_start = self.scheduled_time + timedelta(minutes=lo)
         window_end = self.scheduled_time + timedelta(minutes=hi)
 
-        # Never aim past the class end
         latest = min(window_end, self.end_time)
 
-        # Past the random window -> join immediately
         if now >= latest:
             self.actual_time = now
             return
 
-        # Earliest allowed join is either 'now' or the window start, whichever
-        # is later.
         earliest = max(now, window_start)
         if earliest >= latest:
             self.actual_time = now
             return
 
-        # Random point inside [earliest, latest]
         span = (latest - earliest).total_seconds()
         self.actual_time = earliest + timedelta(seconds=random.uniform(0, span))
 
@@ -406,10 +383,8 @@ class SkyroomBot:
                                 f"JSON — assuming +2h "
                                 f"({end_dt:%H:%M} Tehran)")
 
-                # Classify so the user can see exactly what was decided.
-                # "already ended" is unreachable: next_occurrence_range()
-                # never returns a past range — it rolls forward a week
-                # instead. Kept only as a guard against a clock change.
+                # "already ended" is unreachable (next_occurrence_range rolls
+                # forward a week); kept as a guard against a clock change.
                 if now >= end_dt:
                     status = "already ended — will skip"
                 elif start_dt <= now < end_dt:
@@ -427,9 +402,9 @@ class SkyroomBot:
                     class_name=cls_name,
                     url=cls.get("url", "").strip(),
                     scheduled_time=start_dt,
-                    end_time=end_dt, 
-                    user_dict=user,                        
-                    live=bool(cls.get("live", False)), 
+                    end_time=end_dt,
+                    user_dict=user,
+                    live=bool(cls.get("live", False)),
                 )
                 tasks.append(task)
         return tasks
@@ -443,9 +418,7 @@ class SkyroomBot:
     def _worker(self, task: Task) -> None:
         tag = f"[{task.user_name}@{task.class_name}]"
 
-        # ---- 1) end-of-class guard ----
-        # next_occurrence_range() never hands us an ended class, so this only
-        # triggers if the wall clock jumped forward after the task was built.
+        # Only triggers if the wall clock jumped forward after the task was built.
         now = datetime.now(TEHRAN_TZ)
         if now >= task.end_time:
             self._log("INFO",
@@ -453,10 +426,8 @@ class SkyroomBot:
                       f"({task.end_time:%H:%M} Tehran) — skipping")
             return
 
-        # ---- 2) recompute join time with a fresh 'now' ----
         task.compute_actual(self.cfg)
 
-        # ---- 3) describe what we're about to do ----
         now = datetime.now(TEHRAN_TZ)
         wait_s = (task.actual_time - now).total_seconds()
 
@@ -487,7 +458,6 @@ class SkyroomBot:
                       f"{tag} class {task.scheduled_time:%H:%M}"
                       f"-{task.end_time:%H:%M} is in progress — joining now")
 
-        # ---- 4) restart loop ----
         for attempt in range(1, self.cfg.max_restarts + 1):
             if self.stop_event.is_set():
                 self._log("INFO", f"{tag} stop requested before attempt {attempt}")
@@ -507,9 +477,7 @@ class SkyroomBot:
             except WebDriverException as e:
                 self._log("ERROR", f"{tag} attempt {attempt} driver error: {e}")
                 if "Could not start Chrome" in str(e):
-                    # Fatal environment problem (Chrome missing/broken,
-                    # no usable driver) — retrying every 3s won't fix it.
-                    # Stop this task instead of spamming 30 identical errors.
+                    # Retrying won't fix a broken Chrome install; stop this task.
                     self._log("ERROR",
                               f"{tag} Chrome cannot start on this machine — "
                               f"task stopped (fix the issue above and press "
@@ -528,11 +496,9 @@ class SkyroomBot:
     # ----- driver + clicks -----
     @staticmethod
     def _chrome_launch_env() -> dict:
-        # PyInstaller onefile exports its bundled libs via LD_LIBRARY_PATH
-        # pointing at the _MEI temp dir. Chrome honors that and picks up
-        # the bundle's older libnss3.so instead of the system one, then
-        # dies with "libnss3.so: version `NSS_x' not found". Strip any
-        # bundle dir from the library search path so Chrome uses system NSS.
+        # PyInstaller onefile leaks its bundled libs via LD_LIBRARY_PATH, so
+        # Chrome picks up the bundle's older libnss3.so and dies. Strip any
+        # bundle dir so Chrome uses system NSS.
         env = os.environ.copy()
         bundle_dir = getattr(sys, "_MEIPASS", None)
 
@@ -568,12 +534,12 @@ class SkyroomBot:
                 if p.exists():
                     return str(p)
         # dev mode
-        local = Path(__file__).parent / 'drivers' / (
-            'chromedriver.exe' if sys.platform == 'win32' else 'chromedriver')
+        local = Path(__file__).parent / "drivers" / (
+            "chromedriver.exe" if sys.platform == "win32" else "chromedriver")
         if local.exists():
             return str(local)
-        return None    # fall back to Selenium Manager
-    # ----- driver discovery (once per run, shared by every task) -----
+        return None  # fall back to Selenium Manager
+
     @staticmethod
     def _chrome_binary() -> Optional[str]:
         """Locate the installed Chrome/Chromium, or None if it is missing."""
@@ -630,15 +596,7 @@ class SkyroomBot:
         return None
 
     def _resolve_driver(self) -> Optional[str]:
-        """
-        Decide once per bot run which chromedriver to use (None = let
-        Selenium Manager handle it).
-
-        Every task thread used to repeat this on every retry, so N classes
-        over R restarts meant N×R `chromedriver --version` subprocesses, and
-        several threads could enter Selenium Manager simultaneously and race
-        each other's download into the shared cache.
-        """
+        """Decide once per run which chromedriver to use (None = Selenium Manager)."""
         if self._driver_ready.is_set():
             return self._driver_path
         with self._driver_lock:
@@ -651,12 +609,7 @@ class SkyroomBot:
         return self._driver_path
 
     def preflight(self) -> List[str]:
-        """
-        Cheap environment checks the user can act on, in plain language.
-        An empty list means the machine looks ready.  Runs before the first
-        browser is opened so problems surface as one readable message
-        instead of a wall of Selenium errors.
-        """
+        """Checks the user can act on, before the first browser opens."""
         problems: List[str] = []
 
         if not self._chrome_binary():
@@ -699,11 +652,8 @@ class SkyroomBot:
         opts.add_experimental_option("excludeSwitches", ["enable-automation"])
         opts.add_experimental_option("useAutomationExtension", False)
 
-        # On Linux, running Chrome as root without --no-sandbox makes it exit
-        # immediately ("Running as root without --no-sandbox is not
-        # supported"), which surfaces as "session not created: Chrome
-        # instance exited". Also detect Wayland and force X11/Xvfb-compatible
-        # flags where needed. Do not blindly pass --no-sandbox on Windows.
+        # Chrome as root exits immediately without --no-sandbox; Wayland
+        # needs an X11 hint. Never pass --no-sandbox on Windows.
         try:
             is_root = (os.geteuid() == 0) if hasattr(os, "geteuid") else False
         except Exception:
@@ -717,14 +667,7 @@ class SkyroomBot:
         return opts
 
     def _build_driver(self) -> webdriver.Chrome:
-        """
-        Open one fresh incognito session.
-
-        The driver *binary* was already resolved once in _resolve_driver;
-        only the launch itself is repeated per attempt.  Selenium Manager is
-        serialized so two classes starting at the same time cannot race each
-        other's download.
-        """
+        """Open one fresh incognito session."""
         opts = self._chrome_options()
         chrome_env = self._chrome_launch_env()
 
@@ -753,23 +696,17 @@ class SkyroomBot:
                     self._log("WARNING",
                               f"bundled/manual driver failed ({path}): {e} — "
                               "falling back to Selenium Manager")
-                # Don't let the rest of the run keep retrying a driver we
-                # already know is wrong.
                 with self._driver_lock:
                     if self._driver_path == path:
                         self._driver_path = None
 
-        # ---- Selenium Manager (auto-resolve / auto-download) ----
-        # Skip it when the pinned driver failed with a plain "Chrome instance
-        # exited": that means Chrome itself cannot start, and SM would hit
-        # the same wall while hiding the real cause.
+        # A plain "Chrome instance exited" means Chrome itself cannot start;
+        # Selenium Manager would hit the same wall while hiding the cause.
         if last_err and not version_mismatch and (
                 "session not created" in str(last_err)
                 and "Chrome instance exited" in str(last_err)):
             service_log = self._capture_service_log(
                 opts, [path] if path else [])
-            # The verbose log is diagnostic noise for a dialog: it belongs in
-            # the log tab, not in a message a user has to read.
             self._log("ERROR", f"chromedriver diagnostic: {service_log}")
             raise WebDriverException(
                 "Could not start Chrome: Chrome itself exited "
@@ -876,7 +813,6 @@ class SkyroomBot:
         with self._drivers_lock:
             self.active_drivers.discard(driver)
 
-    # ----- one full attempt -----
     def _join_room_once(self, task: Task, attempt: int, tag: str) -> str:
         self._log("INFO", f"{tag} attempt {attempt}: fresh incognito session")
         driver = self._build_driver()
@@ -886,7 +822,6 @@ class SkyroomBot:
             driver.get(task.url)
             wait = WebDriverWait(driver, self.cfg.element_timeout)
 
-            # STEP 1 - guest login
             guest_btn = wait.until(EC.element_to_be_clickable(
                 (By.CSS_SELECTOR, '[data-name="guess-login-button"]')
             ))
@@ -894,7 +829,6 @@ class SkyroomBot:
                 raise WebDriverException("could not click guest-login")
             self._log("INFO", f"{tag} clicked 'ورود میهمان'")
 
-            # STEP 2 - nickname
             nick_input = wait.until(EC.visibility_of_element_located(
                 (By.CSS_SELECTOR, '[data-name="nickname-dialog-input"]')
             ))
