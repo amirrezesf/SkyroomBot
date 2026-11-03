@@ -1,6 +1,6 @@
 <div align="center" dir="rtl">
 
-<img src="assets/banner.png" alt="ربات اسکای‌روم" width="100%"/>
+<img src="mockups/banner.png" alt="ربات اسکای‌روم" width="100%"/>
 
 # ربات اسکای‌روم
 
